@@ -1,4 +1,4 @@
-# Gridtiles
+# WebXTile
 
 Efficient storage and retrieval of 3-D geographical grids as a spatial octree with msgpack containers, designed for progressive web-frontend consumption.
 
