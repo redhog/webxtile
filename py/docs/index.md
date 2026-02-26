@@ -8,7 +8,7 @@ Supports full roundtrip with [xarray](https://xarray.dev) Datasets following [CF
 
 | Document | Contents |
 |----------|----------|
-| [User Guide](guide.md) | Installation, writing, reading, level-of-detail, examples |
+| [User Guide](guide.md) | Installation, writing, reading, level-of-detail, examples, testing |
 | [API Reference](api.md) | `write_gridtiles`, `read_gridtiles`, xarray engine & accessor, CF detection |
 | [Format Specification](format.md) | Tile file layout, msgpack schema, LOD data model, reconstruction |
 

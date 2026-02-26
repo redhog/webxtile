@@ -248,3 +248,69 @@ ds2 = gridtiles.read_gridtiles("tiles/")
 | Internal node data values | Approximate — bilinear average of children (see [format spec](format.md#internal-node-data-values)) |
 
 The only loss is that internal (non-leaf) tile data is a downsampled approximation; this is intentional and is what enables level-of-detail reads.
+
+---
+
+## Testing
+
+The test suite lives under `py/tests/` and is split into two files:
+
+| File | What it tests |
+|------|---------------|
+| `py/tests/test_roundtrip.py` | Pure Python: write → read roundtrips at full resolution, various bboxes, and multiple LOD levels (2-D and 3-D) |
+| `py/tests/test_js.py` | Cross-language: Python writes tiles, Node.js reads them via `WebxtileResult`, both outputs are compared |
+
+### Prerequisites
+
+**Python tests** — `pytest` must be installed in the active environment:
+
+```bash
+pip install pytest
+# or, if using the project virtualenv:
+pip install -e ".[dev]"
+```
+
+**Cross-language tests** — Node.js (v18+) and the JS dependencies:
+
+```bash
+cd js/
+npm install
+```
+
+### Running the tests
+
+From the `py/` directory:
+
+```bash
+# Python roundtrip tests only
+pytest tests/test_roundtrip.py -v
+
+# Cross-language Python → JS tests only
+pytest tests/test_js.py -v
+
+# Everything
+pytest tests/ -v
+```
+
+From the repository root (adjust the path to your virtualenv's `pytest`):
+
+```bash
+env/bin/pytest deps/webxtile/py/tests/ -v
+```
+
+### How the cross-language tests work
+
+`test_js.py` calls `js/tests/read_tiles.mjs` as a subprocess via `node`.  That
+script reads the msgpack tile files directly from the filesystem (no HTTP server
+or IndexedDB required), feeds them into `WebxtileResult`, calls `toScatter()` /
+`getCoord()`, and prints a JSON summary to stdout.  The Python test then
+compares that JSON against the xarray Dataset returned by `read_gridtiles()` for
+the same query parameters.
+
+Each cross-language test exercises a different combination of bbox and level:
+
+- Full resolution (no filter)
+- Three distinct bboxes: centre region, left strip, top-right quadrant
+- Level 0, 1, and 2 (progressively coarser overviews)
+- Bbox combined with level 1
+- 3-D variants: full resolution, level 0, and a sub-volume bbox
