@@ -1,8 +1,8 @@
-# Gridtiles Format Specification
+# WebXTile Format Specification
 
 ## Overview
 
-A gridtiles dataset is a **directory** containing one `metadata.msgpack` file and one or more tile files (`*.msgpack`).  All files use [msgpack](https://msgpack.org/) encoding with [msgpack-numpy](https://github.com/lebedov/msgpack-numpy) extensions for numpy arrays.
+A webxtile dataset is a **directory** containing one `metadata.msgpack` file and one or more tile files (`*.msgpack`).  All files use [msgpack](https://msgpack.org/) encoding with [msgpack-numpy](https://github.com/lebedov/msgpack-numpy) extensions for numpy arrays.
 
 The tree structure is determined by the number of spatial dimensions:
 
@@ -135,4 +135,4 @@ Reading at a specific `level` gives a lower-resolution grid assembled from whate
 
 The `bounds` field is always 6 elements so that JavaScript readers can use a single fixed-size layout regardless of whether the dataset is 2-D or 3-D.  Readers determine how many `bounds` entries are meaningful by inspecting `len(spatial_dims)` from `metadata.msgpack`.
 
-The companion JS client (`deps/gridtiles/js/gridtiles.js`) reads all fields described in this specification.  It uses `spatial_dims` from metadata to determine the tree type, reads `spatial_coords` for coordinate values, and uses `is_leaf` / `level` for LOD traversal.
+The companion JS client (`deps/webxtile/js/webxtile.js`) reads all fields described in this specification.  It uses `spatial_dims` from metadata to determine the tree type, reads `spatial_coords` for coordinate values, and uses `is_leaf` / `level` for LOD traversal.

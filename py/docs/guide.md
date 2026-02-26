@@ -1,10 +1,10 @@
-# Gridtiles User Guide
+# WebXTile User Guide
 
 ## Installation
 
 ```bash
-pip install gridtiles           # from PyPI (when published)
-pip install -e /path/to/gridtiles  # editable install from source
+pip install webxtile           # from PyPI (when published)
+pip install -e /path/to/webxtile  # editable install from source
 ```
 
 Dependencies: `xarray`, `numpy`, `msgpack`, `msgpack-numpy`, `scipy`.
@@ -15,17 +15,17 @@ Optional: `pyproj` (for coordinate projection helpers).
 ## Quick start
 
 ```python
-import gridtiles
+import webxtile
 import xarray as xr
 
 # ── Write ─────────────────────────────────────────────────────────────────────
-gridtiles.write_gridtiles(ds, "tiles/")
+webxtile.write_webxtile(ds, "tiles/")
 
 # ── Read (full resolution) ────────────────────────────────────────────────────
-ds2 = gridtiles.read_gridtiles("tiles/")
+ds2 = webxtile.read_webxtile("tiles/")
 
 # ── Read via xarray engine ────────────────────────────────────────────────────
-ds2 = xr.open_dataset("tiles/", engine="gridtiles")
+ds2 = xr.open_dataset("tiles/", engine="webxtile")
 ```
 
 ---
@@ -58,7 +58,7 @@ ds = xr.Dataset(
     attrs={"Conventions": "CF-1.8"},
 )
 
-gridtiles.write_gridtiles(ds, "tiles/")   # octree, 8 children per node
+webxtile.write_webxtile(ds, "tiles/")   # octree, 8 children per node
 ```
 
 **2-D dataset (quadtree):**
@@ -73,7 +73,7 @@ ds = xr.Dataset(
     attrs={"Conventions": "CF-1.8"},
 )
 
-gridtiles.write_gridtiles(ds, "tiles/")   # quadtree, 4 children per node
+webxtile.write_webxtile(ds, "tiles/")   # quadtree, 4 children per node
 ```
 
 ### Explicit spatial dimensions
@@ -82,10 +82,10 @@ When dimension names or attributes are ambiguous, pass `spatial_dims` explicitly
 
 ```python
 # 3-D → octree
-gridtiles.write_gridtiles(ds, "tiles/", spatial_dims=["easting", "northing", "depth"])
+webxtile.write_webxtile(ds, "tiles/", spatial_dims=["easting", "northing", "depth"])
 
 # 2-D → quadtree
-gridtiles.write_gridtiles(ds, "tiles/", spatial_dims=["easting", "northing"])
+webxtile.write_webxtile(ds, "tiles/", spatial_dims=["easting", "northing"])
 ```
 
 ### Tuning tile size
@@ -94,10 +94,10 @@ gridtiles.write_gridtiles(ds, "tiles/", spatial_dims=["easting", "northing"])
 
 ```python
 # finer tiles – good for large datasets with selective queries
-gridtiles.write_gridtiles(ds, "tiles/", max_leaf=16)
+webxtile.write_webxtile(ds, "tiles/", max_leaf=16)
 
 # coarser tiles – fewer files, faster for whole-dataset reads
-gridtiles.write_gridtiles(ds, "tiles/", max_leaf=64)
+webxtile.write_webxtile(ds, "tiles/", max_leaf=64)
 ```
 
 Rule of thumb: choose `max_leaf` so that each leaf tile fits comfortably in memory for a single frontend render call (e.g. 32–128 points per axis).  The same guidance applies for both quadtree and octree datasets.
@@ -107,7 +107,7 @@ Rule of thumb: choose `max_leaf` so that each leaf tile fits comfortably in memo
 The `crs` and `z_crs` parameters are stored in `metadata.msgpack` for consumers that need to reproject coordinates.  They do not affect how data is stored.
 
 ```python
-gridtiles.write_gridtiles(
+webxtile.write_webxtile(
     ds, "tiles/",
     crs="EPSG:32632",    # UTM zone 32N
     z_crs="EPSG:5773",   # EGM96 geoid
@@ -117,7 +117,7 @@ gridtiles.write_gridtiles(
 ### xarray accessor
 
 ```python
-ds.gridtiles.to_gridtiles("tiles/", max_leaf=32, crs="EPSG:3857")
+ds.webxtile.to_webxtile("tiles/", max_leaf=32, crs="EPSG:3857")
 ```
 
 ---
@@ -127,9 +127,9 @@ ds.gridtiles.to_gridtiles("tiles/", max_leaf=32, crs="EPSG:3857")
 ### Full resolution (default)
 
 ```python
-ds = gridtiles.read_gridtiles("tiles/")
+ds = webxtile.read_webxtile("tiles/")
 # or
-ds = xr.open_dataset("tiles/", engine="gridtiles")
+ds = xr.open_dataset("tiles/", engine="webxtile")
 ```
 
 All leaf tiles are loaded and merged.  The returned dataset is identical to the one that was written (same coordinates, dtypes, and attributes).
@@ -137,9 +137,9 @@ All leaf tiles are loaded and merged.  The returned dataset is identical to the 
 ### Level-of-detail reads
 
 ```python
-ds_lo = gridtiles.read_gridtiles("tiles/", level=0)   # root tile only
-ds_l1 = gridtiles.read_gridtiles("tiles/", level=1)   # one level below root
-ds_l2 = gridtiles.read_gridtiles("tiles/", level=2)   # two levels below root
+ds_lo = webxtile.read_webxtile("tiles/", level=0)   # root tile only
+ds_l1 = webxtile.read_webxtile("tiles/", level=1)   # one level below root
+ds_l2 = webxtile.read_webxtile("tiles/", level=2)   # two levels below root
 ```
 
 Each level halves the number of grid points along each spatial axis relative to the level above.  The same mechanic applies to both quadtree and octree datasets; only the number of axes that are halved differs.
@@ -176,19 +176,19 @@ The bbox format mirrors the number of spatial dimensions:
 
 ```python
 # 2-D bbox
-ds_sub = gridtiles.read_gridtiles(
+ds_sub = webxtile.read_webxtile(
     "tiles/",
     bbox=[500_000, 6_200_000, 520_000, 6_220_000],
 )
 
 # 3-D bbox
-ds_sub = gridtiles.read_gridtiles(
+ds_sub = webxtile.read_webxtile(
     "tiles/",
     bbox=[500_000, 6_200_000, -500, 520_000, 6_220_000, 0],
 )
 
 # Combined with level-of-detail (works the same for 2-D and 3-D)
-ds_sub_lo = gridtiles.read_gridtiles(
+ds_sub_lo = webxtile.read_webxtile(
     "tiles/",
     level=2,
     bbox=[500_000, 6_200_000, -500, 520_000, 6_220_000, 0],
@@ -216,7 +216,7 @@ ds = xr.Dataset(
         "x": ..., "y": ..., "z": ...,
     },
 )
-gridtiles.write_gridtiles(ds, "tiles/", spatial_dims=["x", "y", "z"])
+webxtile.write_webxtile(ds, "tiles/", spatial_dims=["x", "y", "z"])
 
 # 2-D quadtree with a time dimension
 ds = xr.Dataset(
@@ -226,9 +226,9 @@ ds = xr.Dataset(
         "lat": ..., "lon": ...,
     },
 )
-gridtiles.write_gridtiles(ds, "tiles/", spatial_dims=["lat", "lon"])
+webxtile.write_webxtile(ds, "tiles/", spatial_dims=["lat", "lon"])
 
-ds2 = gridtiles.read_gridtiles("tiles/")
+ds2 = webxtile.read_webxtile("tiles/")
 # ds2.time values, dtype, and attrs are identical to the original
 ```
 
@@ -304,7 +304,7 @@ env/bin/pytest deps/webxtile/py/tests/ -v
 script reads the msgpack tile files directly from the filesystem (no HTTP server
 or IndexedDB required), feeds them into `WebxtileResult`, calls `toScatter()` /
 `getCoord()`, and prints a JSON summary to stdout.  The Python test then
-compares that JSON against the xarray Dataset returned by `read_gridtiles()` for
+compares that JSON against the xarray Dataset returned by `read_webxtile()` for
 the same query parameters.
 
 Each cross-language test exercises a different combination of bbox and level:

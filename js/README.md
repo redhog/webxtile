@@ -1,6 +1,6 @@
-# gridtiles (JS)
+# webxtile (JS)
 
-Browser client for the [gridtiles](../py) octree format.  Read-only; designed
+Browser client for the [webxtile](../py) octree format.  Read-only; designed
 for partial bbox loads and level-of-detail rendering in web applications.
 
 The Python library writes a directory of msgpack tile files.  This library
@@ -10,21 +10,21 @@ arrays suitable for WebGL / point-cloud rendering.
 ## Installation
 
 ```bash
-npm install gridtiles
+npm install webxtile
 ```
 
 Or install directly from the local source tree:
 
 ```bash
-npm install ./deps/gridtiles/js
+npm install ./deps/webxtile/js
 ```
 
 ## Quick start
 
 ```js
-import { GridtilesLoader } from "gridtiles";
+import { WebxtileLoader } from "webxtile";
 
-const loader = new GridtilesLoader("https://example.com/tiles");
+const loader = new WebxtileLoader("https://example.com/tiles");
 await loader.open();   // fetches metadata.msgpack
 
 // Full-resolution load for a 2-D bounding box
@@ -38,12 +38,12 @@ const { coords, variables, count } = result.toScatter();
 
 ## API
 
-### `new GridtilesLoader(baseUrl, [options])`
+### `new WebxtileLoader(baseUrl, [options])`
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `baseUrl` | `string` | — | Base URL of the tile directory (no trailing slash). |
-| `options.dbName` | `string` | `"gridtiles-cache"` | IndexedDB database name.  Use a unique name per dataset when serving multiple datasets from the same origin. |
+| `options.dbName` | `string` | `"webxtile-cache"` | IndexedDB database name.  Use a unique name per dataset when serving multiple datasets from the same origin. |
 
 ---
 
@@ -64,7 +64,7 @@ Contains `spatial_dims`, `crs`, `z_crs`, `dim_sizes`, `var_meta`,
 
 ---
 
-### `loader.loadBBox(bbox, [options])` → `Promise<GridResult>`
+### `loader.loadBBox(bbox, [options])` → `Promise<WebxtileResult>`
 
 Load all tiles that intersect `bbox` down to the requested depth.
 
@@ -107,7 +107,7 @@ when the server-side data has been regenerated.
 
 ---
 
-### `GridResult`
+### `WebxtileResult`
 
 Returned by `loadBBox`.
 
