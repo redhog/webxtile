@@ -534,9 +534,14 @@ def _write_internal_tile(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _bbox_intersects(bounds: list, bbox: list, n_spatial: int) -> bool:
-    """Test whether *bounds* overlaps *bbox* in the first *n_spatial* axes."""
+    """Test whether *bounds* overlaps *bbox* in the first *n_spatial* axes.
+
+    ``bounds`` is always 6 elements: [x_min, y_min, z_min, x_max, y_max, z_max]
+    (z values are 0.0 padding for 2-D datasets).  Max values therefore start at
+    index 3, matching the JavaScript ``_intersects`` implementation.
+    """
     for i in range(n_spatial):
-        if bbox[i + n_spatial] < bounds[i] or bbox[i] > bounds[i + n_spatial]:
+        if bbox[i + n_spatial] < bounds[i] or bbox[i] > bounds[i + 3]:
             return False
     return True
 
