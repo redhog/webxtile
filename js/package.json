@@ -1,0 +1,30 @@
+{
+  "name": "gridtiles",
+  "version": "0.1.0",
+  "description": "Browser client for the gridtiles octree format — partial bbox loads for web visualisation",
+  "type": "module",
+  "main": "gridtiles.js",
+  "exports": {
+    ".": "./gridtiles.js"
+  },
+  "files": [
+    "gridtiles.js"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "gridtiles",
+    "geophysics",
+    "octree",
+    "quadtree",
+    "msgpack",
+    "xarray",
+    "webgl",
+    "visualization",
+    "level-of-detail",
+    "lod"
+  ],
+  "dependencies": {
+    "@msgpack/msgpack": "^3.0.0",
+    "idb": "^8.0.0"
+  }
+}

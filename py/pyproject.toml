@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gridtiles"
+version = "0.1.0"
+description = "3D geographic grid octree storage with msgpack tiles; full xarray/CF roundtrip"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "xarray>=0.18",
+    "numpy",
+    "msgpack>=1.0",
+    "msgpack-numpy>=0.4.7",
+    "scipy",
+]
+
+[project.optional-dependencies]
+projection = ["pyproj"]
+dev = ["pytest", "numpy"]
+
+# ── xarray engine registration ────────────────────────────────────────────────
+# Allows:  xr.open_dataset("tiles/", engine="gridtiles")
+[project.entry-points."xarray.backends"]
+gridtiles = "gridtiles:GridtilesBackend"
