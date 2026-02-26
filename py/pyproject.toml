@@ -3,8 +3,8 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gridtiles"
-version = "0.1.0"
+name = "webxtile"
+version = "0.0.1"
 description = "3D geographic grid octree storage with msgpack tiles; full xarray/CF roundtrip"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -22,6 +22,6 @@ projection = ["pyproj"]
 dev = ["pytest", "numpy"]
 
 # ── xarray engine registration ────────────────────────────────────────────────
-# Allows:  xr.open_dataset("tiles/", engine="gridtiles")
+# Allows:  xr.open_dataset("tiles/", engine="webxtile")
 [project.entry-points."xarray.backends"]
-gridtiles = "gridtiles:GridtilesBackend"
+webxtile = "webxtile:WebxtileBackend"

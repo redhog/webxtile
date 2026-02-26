@@ -1,4 +1,4 @@
-"""Gridtiles: 3D geographic grid storage as a spatial octree with msgpack tiles.
+"""Webxtile: 3D geographic grid storage as a spatial octree with msgpack tiles.
 
 The format stores an xarray Dataset as a recursive octree where each tile is a
 msgpack file.  Internal nodes hold a 2× downsampled overview of their subtree so
@@ -17,17 +17,17 @@ Reading at level *L* gives a low-fidelity version of the full dataset:
 
 Public API
 ----------
-write_gridtiles(ds, path, ...)
-    Write an xarray Dataset to a gridtiles directory.
+write_webxtile(ds, path, ...)
+    Write an xarray Dataset to a webxtile directory.
 
-read_gridtiles(path, ...)
-    Read a gridtiles directory into an xarray Dataset.
+read_webxtile(path, ...)
+    Read a webxtile directory into an xarray Dataset.
 
 xarray integration
 ------------------
-xr.open_dataset("tiles/", engine="gridtiles")          # read
-xr.open_dataset("tiles/", engine="gridtiles", level=2) # read at LOD 2
-ds.gridtiles.to_gridtiles("tiles/")                    # write
+xr.open_dataset("tiles/", engine="webxtile")          # read
+xr.open_dataset("tiles/", engine="webxtile", level=2) # read at LOD 2
+ds.webxtile.to_webxtile("tiles/")                    # write
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ from scipy.ndimage import zoom
 m.patch()
 
 __version__ = "0.1.0"
-__all__ = ["write_gridtiles", "read_gridtiles", "GridtilesBackend"]
+__all__ = ["write_webxtile", "read_webxtile", "WebxtileBackend"]
 
 _METADATA_FILE = "metadata.msgpack"
 _ROOT_TILE = "root.msgpack"
@@ -53,7 +53,7 @@ _FORMAT_VERSION = 1
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def write_gridtiles(
+def write_webxtile(
     ds: xr.Dataset,
     path: str | Path,
     *,
@@ -62,7 +62,7 @@ def write_gridtiles(
     crs: str | None = None,
     z_crs: str | None = None,
 ) -> None:
-    """Write an xarray Dataset to gridtiles octree format.
+    """Write an xarray Dataset to webxtile octree format.
 
     Parameters
     ----------
@@ -97,18 +97,18 @@ def write_gridtiles(
     _build_tile(ds, path / _ROOT_TILE, spatial_dims, level=0, max_leaf=max_leaf)
 
 
-def read_gridtiles(
+def read_webxtile(
     path: str | Path,
     *,
     level: int | None = None,
     bbox: list[float] | None = None,
 ) -> xr.Dataset:
-    """Read a gridtiles octree into an xarray Dataset.
+    """Read a webxtile octree into an xarray Dataset.
 
     Parameters
     ----------
     path:
-        Directory produced by :func:`write_gridtiles`.
+        Directory produced by :func:`write_webxtile`.
     level:
         Octree depth to read.  ``0`` = root (coarsest overview).
         ``None`` (default) = all leaf tiles (full resolution).
@@ -138,16 +138,16 @@ def read_gridtiles(
 try:
     from xarray.backends import BackendEntrypoint as _BackendEntrypoint
 
-    class GridtilesBackend(_BackendEntrypoint):
-        """xarray backend for the gridtiles octree format.
+    class WebxtileBackend(_BackendEntrypoint):
+        """xarray backend for the webxtile octree format.
 
         Usage::
 
-            ds = xr.open_dataset("tiles/", engine="gridtiles")
-            ds = xr.open_dataset("tiles/", engine="gridtiles", level=2)
+            ds = xr.open_dataset("tiles/", engine="webxtile")
+            ds = xr.open_dataset("tiles/", engine="webxtile", level=2)
         """
 
-        description = "Load 3-D geographic grids from gridtiles octree format"
+        description = "Load 3-D geographic grids from webxtile octree format"
 
         # All parameters accepted by open_dataset must be listed here so
         # xarray can validate keyword arguments.
@@ -175,11 +175,11 @@ try:
             drop_variables=None,
             use_cftime=None,
             decode_timedelta=None,
-            # gridtiles-specific keyword arguments
+            # webxtile-specific keyword arguments
             level: int | None = None,
             bbox: list[float] | None = None,
         ) -> xr.Dataset:
-            ds = read_gridtiles(filename_or_obj, level=level, bbox=bbox)
+            ds = read_webxtile(filename_or_obj, level=level, bbox=bbox)
             if drop_variables:
                 ds = ds.drop_vars(
                     [v for v in drop_variables if v in ds], errors="ignore"
@@ -188,26 +188,26 @@ try:
 
 except ImportError:
     # xarray is missing or too old to expose BackendEntrypoint
-    class GridtilesBackend:  # type: ignore[no-redef]
+    class WebxtileBackend:  # type: ignore[no-redef]
         """Stub – xarray.backends.BackendEntrypoint not available."""
 
 
-@xr.register_dataset_accessor("gridtiles")
-class GridtilesAccessor:
-    """xarray Dataset accessor for writing gridtiles format.
+@xr.register_dataset_accessor("webxtile")
+class WebxtileAccessor:
+    """xarray Dataset accessor for writing webxtile format.
 
     Usage::
 
-        ds.gridtiles.to_gridtiles("tiles/")
-        ds.gridtiles.to_gridtiles("tiles/", max_leaf=64, crs="EPSG:3857")
+        ds.webxtile.to_webxtile("tiles/")
+        ds.webxtile.to_webxtile("tiles/", max_leaf=64, crs="EPSG:3857")
     """
 
     def __init__(self, obj: xr.Dataset) -> None:
         self._obj = obj
 
-    def to_gridtiles(self, path: str | Path, **kwargs) -> None:
-        """Write the Dataset to gridtiles format (see :func:`write_gridtiles`)."""
-        write_gridtiles(self._obj, path, **kwargs)
+    def to_webxtile(self, path: str | Path, **kwargs) -> None:
+        """Write the Dataset to webxtile format (see :func:`write_webxtile`)."""
+        write_webxtile(self._obj, path, **kwargs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

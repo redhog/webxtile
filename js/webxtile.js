@@ -1,12 +1,12 @@
 /**
- * gridtiles.js
- * Browser client for the gridtiles octree format.
+ * webxtile.js
+ * Browser client for the webxtile octree format.
  * Read-only; designed for partial bbox loads for web visualisation.
  *
  * @example
- *   import { GridtilesLoader } from "gridtiles";
+ *   import { WebxtileLoader } from "webxtile";
  *
- *   const loader = new GridtilesLoader("https://example.com/tiles");
+ *   const loader = new WebxtileLoader("https://example.com/tiles");
  *   await loader.open();   // loads metadata.msgpack
  *
  *   // Full-resolution load for a 2-D bbox
@@ -93,7 +93,7 @@ function _intersects(tileBounds, bbox, nSpatial) {
   return true;
 }
 
-// ─── GridResult ───────────────────────────────────────────────────────────────
+// ─── WebxtileResult ───────────────────────────────────────────────────────────
 
 /**
  * Holds the tiles collected for a bbox / level query.
@@ -104,7 +104,7 @@ function _intersects(tileBounds, bbox, nSpatial) {
  *   - `getCoord(dimName)` — merged sorted coordinate values for one dim.
  *   - `tiles` / `meta` — raw access for custom processing.
  */
-export class GridResult {
+export class WebxtileResult {
   /**
    * @param {object}   meta  - decoded metadata.msgpack
    * @param {object[]} tiles - decoded tile objects
@@ -267,17 +267,17 @@ export class GridResult {
   }
 }
 
-// ─── GridtilesLoader ──────────────────────────────────────────────────────────
+// ─── WebxtileLoader ───────────────────────────────────────────────────────────
 
 /**
- * Loader for a gridtiles octree dataset served over HTTP.
+ * Loader for a webxtile octree dataset served over HTTP.
  *
  * Tiles are persisted to IndexedDB after the first network fetch so that
  * repeated loads within a session (or across sessions) avoid redundant
  * requests.
  *
  * @example
- *   const loader = new GridtilesLoader("https://host/tiles");
+ *   const loader = new WebxtileLoader("https://host/tiles");
  *   await loader.open();
  *
  *   // Load leaves inside a 2-D bbox (full resolution)
@@ -286,16 +286,16 @@ export class GridResult {
  *   // Coarse overview (level 2)
  *   const lo = await loader.loadBBox(null, { level: 2 });
  */
-export class GridtilesLoader {
+export class WebxtileLoader {
   /**
    * @param {string} baseUrl    - Base URL of the tile directory (trailing
    *   slash optional).
    * @param {object} [options]
-   * @param {string} [options.dbName="gridtiles-cache"] - IndexedDB database
+   * @param {string} [options.dbName="webxtile-cache"] - IndexedDB database
    *   name.  Use a unique name per dataset if you serve multiple datasets from
    *   the same origin.
    */
-  constructor(baseUrl, { dbName = 'gridtiles-cache' } = {}) {
+  constructor(baseUrl, { dbName = 'webxtile-cache' } = {}) {
     this._base       = baseUrl.replace(/\/$/, '');
     this._dbName     = dbName;
     this._meta       = null;   // set by open()
@@ -429,7 +429,7 @@ export class GridtilesLoader {
     const nSpatial = this._meta.spatial_dims.length;
     const rootFile = this._meta.root_tile ?? 'root.msgpack';
     const tiles    = await this._collectTiles(rootFile, bbox, level, nSpatial);
-    return new GridResult(this._meta, tiles);
+    return new WebxtileResult(this._meta, tiles);
   }
 
   /**

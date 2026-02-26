@@ -1,18 +1,18 @@
 {
-  "name": "gridtiles",
-  "version": "0.1.0",
-  "description": "Browser client for the gridtiles octree format — partial bbox loads for web visualisation",
+  "name": "webxtile",
+  "version": "0.0.1",
+  "description": "Browser client for the webxtile octree format — partial bbox loads for web visualisation",
   "type": "module",
-  "main": "gridtiles.js",
+  "main": "webxtile.js",
   "exports": {
-    ".": "./gridtiles.js"
+    ".": "./webxtile.js"
   },
   "files": [
-    "gridtiles.js"
+    "webxtile.js"
   ],
   "license": "MIT",
   "keywords": [
-    "gridtiles",
+    "webxtile",
     "geophysics",
     "octree",
     "quadtree",
