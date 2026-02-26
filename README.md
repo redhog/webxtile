@@ -8,4 +8,3 @@ Supports full roundtrip with [xarray](https://xarray.dev) Datasets following [CF
 
 * [Python xarray reader/writer](py/docs/index.md)
 * [JavaScript reader library for browsers](js/README.md)
-* 
