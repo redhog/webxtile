@@ -78,10 +78,13 @@ def write_webxtile(
         Maximum grid points per tile along any spatial dimension.  Tiles
         smaller than this threshold become leaf nodes.
     crs:
-        Horizontal CRS identifier (e.g. ``"EPSG:3857"``), stored in metadata
-        for consumers that need it.
+        Horizontal CRS identifier (e.g. ``"EPSG:3857"``).  When omitted,
+        the code is auto-detected from CF ``grid_mapping`` variables,
+        coordinate ``standard_name`` attributes, or a non-standard
+        ``epsg_code`` global attribute (requires *pyproj*).
     z_crs:
-        Vertical CRS identifier (e.g. ``"EPSG:4979"``).
+        Vertical CRS identifier (e.g. ``"EPSG:4979"``).  When omitted,
+        detected from a non-standard ``epsg_z_code`` global attribute.
     """
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -93,7 +96,13 @@ def write_webxtile(
             f"spatial_dims must have 2 or 3 elements, got {spatial_dims}"
         )
 
-    _pack(path / _METADATA_FILE, _build_metadata(ds, spatial_dims, crs, z_crs))
+    crs, z_crs, crs_cf_attrs, z_crs_cf_attrs = _resolve_crs_for_write(
+        ds, crs, z_crs
+    )
+    _pack(
+        path / _METADATA_FILE,
+        _build_metadata(ds, spatial_dims, crs, z_crs, crs_cf_attrs, z_crs_cf_attrs),
+    )
     _build_tile(ds, path / _ROOT_TILE, spatial_dims, level=0, max_leaf=max_leaf)
 
 
@@ -313,14 +322,159 @@ def _serialisable_attrs(attrs: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CRS / EPSG helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_epsg(value) -> "str | None":
+    """Normalise *value* to ``'EPSG:NNNN'``, or return it as-is if non-numeric."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if s.upper().startswith("EPSG:"):
+        return s.upper()
+    try:
+        int(s)
+        return f"EPSG:{s}"
+    except ValueError:
+        return s  # pass through other string identifiers unchanged
+
+
+def _has_cf_grid_mapping(ds: xr.Dataset) -> bool:
+    """Return True if *ds* contains any variable/coord with ``grid_mapping_name``."""
+    for name in list(ds.data_vars) + list(ds.coords):
+        try:
+            if "grid_mapping_name" in ds[name].attrs:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _detect_epsg_from_cf(ds: xr.Dataset, ProjCRS) -> "str | None":
+    """Detect horizontal CRS EPSG code from CF metadata in *ds*.
+
+    Checked in order:
+
+    1. Non-standard ``epsg_code`` / ``crs_epsg`` global attribute.
+    2. A coordinate/variable with ``grid_mapping_name`` → ``pyproj.CRS.from_cf()``.
+    3. Coordinates with ``standard_name`` ``"longitude"`` **and** ``"latitude"``
+       → assumes a geographic CRS and calls ``pyproj.CRS.from_cf()``.
+    """
+    # 1. Non-standard global attribute
+    for key in ("epsg_code", "crs_epsg"):
+        val = ds.attrs.get(key)
+        if val is not None:
+            return _parse_epsg(val)
+
+    # 2. Grid mapping variable
+    for name in list(ds.data_vars) + list(ds.coords):
+        try:
+            obj = ds[name]
+        except Exception:
+            continue
+        if "grid_mapping_name" in obj.attrs:
+            try:
+                proj_crs = ProjCRS.from_cf(dict(obj.attrs))
+                epsg = proj_crs.to_epsg()
+                if epsg:
+                    return f"EPSG:{epsg}"
+            except Exception:
+                pass
+
+    # 3. lon/lat standard_names → geographic CRS
+    has_lon = has_lat = False
+    for coord in ds.coords.values():
+        sn = coord.attrs.get("standard_name", "")
+        if sn == "longitude":
+            has_lon = True
+        elif sn == "latitude":
+            has_lat = True
+    if has_lon and has_lat:
+        # Coordinates named longitude/latitude without an explicit grid_mapping
+        # strongly imply a geographic CRS.  Ask pyproj for the EPSG; fall back
+        # to EPSG:4326 (WGS 84) when the minimal CF params are not enough for
+        # pyproj to resolve a unique code (common with older pyproj builds).
+        try:
+            proj_crs = ProjCRS.from_cf({"grid_mapping_name": "latitude_longitude"})
+            epsg = proj_crs.to_epsg()
+            if epsg:
+                return f"EPSG:{epsg}"
+        except Exception:
+            pass
+        return "EPSG:4326"
+
+    return None
+
+
+def _detect_z_epsg_from_cf(ds: xr.Dataset, ProjCRS) -> "str | None":
+    """Detect vertical CRS EPSG code from non-standard global attributes."""
+    for key in ("epsg_z_code", "z_crs_epsg"):
+        val = ds.attrs.get(key)
+        if val is not None:
+            return _parse_epsg(val)
+    return None
+
+
+def _cf_attrs_from_epsg(epsg_str: str, ProjCRS) -> dict:
+    """Return a CF convention attribute dict for the given EPSG code string."""
+    try:
+        code = epsg_str.upper().replace("EPSG:", "")
+        proj_crs = ProjCRS.from_epsg(int(code))
+        return {str(k): v for k, v in proj_crs.to_cf().items()}
+    except Exception:
+        return {}
+
+
+def _resolve_crs_for_write(
+    ds: xr.Dataset,
+    crs: "str | None",
+    z_crs: "str | None",
+) -> "tuple[str | None, str | None, dict, dict]":
+    """Resolve CRS information for a write operation.
+
+    * Normalise any provided EPSG codes.
+    * If an EPSG code is not provided, attempt detection from CF metadata.
+    * Generate full CF attribute dicts from EPSG codes via pyproj (used both
+      for storage and to reconstruct a ``spatial_ref`` coordinate on read).
+
+    Silently degrades when *pyproj* is not installed.
+
+    Returns
+    -------
+    (crs_epsg, z_crs_epsg, crs_cf_attrs, z_crs_cf_attrs)
+    """
+    try:
+        from pyproj import CRS as ProjCRS
+    except ImportError:
+        return _parse_epsg(crs), _parse_epsg(z_crs), {}, {}
+
+    crs   = _parse_epsg(crs)
+    z_crs = _parse_epsg(z_crs)
+
+    # Detect from CF metadata when not explicitly provided.
+    if crs is None:
+        crs = _detect_epsg_from_cf(ds, ProjCRS)
+    if z_crs is None:
+        z_crs = _detect_z_epsg_from_cf(ds, ProjCRS)
+
+    # Generate CF attribute dicts from EPSG codes.
+    crs_cf_attrs   = _cf_attrs_from_epsg(crs,   ProjCRS) if crs   else {}
+    z_crs_cf_attrs = _cf_attrs_from_epsg(z_crs, ProjCRS) if z_crs else {}
+
+    return crs, z_crs, crs_cf_attrs, z_crs_cf_attrs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Metadata construction
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_metadata(
     ds: xr.Dataset,
     spatial_dims: list[str],
-    crs: str | None,
-    z_crs: str | None,
+    crs: "str | None",
+    z_crs: "str | None",
+    crs_cf_attrs: dict,
+    z_crs_cf_attrs: dict,
 ) -> dict:
     """Assemble the metadata dict stored in metadata.msgpack."""
     coord_meta: dict = {}
@@ -344,16 +498,28 @@ def _build_metadata(
             "attrs": _serialisable_attrs(var.attrs),
         }
 
+    # Augment global attrs with non-standard EPSG attributes so they are
+    # accessible on the reconstructed Dataset without extra API calls.
+    global_attrs = _serialisable_attrs(ds.attrs)
+    if crs is not None and "epsg_code" not in global_attrs:
+        global_attrs["epsg_code"] = crs
+    if z_crs is not None and "epsg_z_code" not in global_attrs:
+        global_attrs["epsg_z_code"] = z_crs
+
     return {
-        "version":      _FORMAT_VERSION,
-        "root_tile":    _ROOT_TILE,
-        "spatial_dims": list(spatial_dims),
-        "crs":          crs,
-        "z_crs":        z_crs,
-        "dim_sizes":    {str(k): int(v) for k, v in ds.sizes.items()},
-        "coord_meta":   coord_meta,
-        "var_meta":     var_meta,
-        "global_attrs": _serialisable_attrs(ds.attrs),
+        "version":        _FORMAT_VERSION,
+        "root_tile":      _ROOT_TILE,
+        "spatial_dims":   list(spatial_dims),
+        "crs":            crs,
+        "z_crs":          z_crs,
+        # Full CF attribute dicts derived from the EPSG codes; used on read to
+        # restore a ``spatial_ref`` grid-mapping coordinate for CF compliance.
+        "crs_cf_attrs":   {str(k): _to_serialisable(v) for k, v in crs_cf_attrs.items()},
+        "z_crs_cf_attrs": {str(k): _to_serialisable(v) for k, v in z_crs_cf_attrs.items()},
+        "dim_sizes":      {str(k): int(v) for k, v in ds.sizes.items()},
+        "coord_meta":     coord_meta,
+        "var_meta":       var_meta,
+        "global_attrs":   global_attrs,
     }
 
 
@@ -692,4 +858,15 @@ def _reconstruct_dataset(tiles: list[dict], meta: dict) -> xr.Dataset:
             attrs=vmeta.get("attrs", {}),
         )
 
-    return xr.Dataset(data_vars, coords=coords, attrs=meta.get("global_attrs", {}))
+    ds = xr.Dataset(data_vars, coords=coords, attrs=meta.get("global_attrs", {}))
+
+    # Restore a CF-compliant grid-mapping coordinate when CRS CF attrs are
+    # stored in metadata and the dataset does not already carry one (either
+    # from the original data or from a preserved coordinate variable).
+    crs_cf_attrs = meta.get("crs_cf_attrs", {})
+    if crs_cf_attrs and not _has_cf_grid_mapping(ds):
+        ds = ds.assign_coords(
+            spatial_ref=xr.Variable([], 0, attrs=crs_cf_attrs)
+        )
+
+    return ds
