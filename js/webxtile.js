@@ -61,16 +61,59 @@ function _decodeNumpy(v) {
   return out;
 }
 
+// ─── Fetch concurrency limiter ────────────────────────────────────────────────
+// Unbounded parallel tile fetches exhaust the browser's pending-request pool
+// (Chrome: ERR_INSUFFICIENT_RESOURCES). Limit total in-flight network fetches
+// across all WebxtileLoader instances so the browser stays responsive.
+
+const _MAX_CONCURRENT_FETCHES = 16;
+let _concurrentFetches = 0;
+const _fetchWaiters = [];
+
+function _acquireFetchSlot() {
+  return new Promise(resolve => {
+    if (_concurrentFetches < _MAX_CONCURRENT_FETCHES) {
+      _concurrentFetches++;
+      resolve();
+    } else {
+      _fetchWaiters.push(resolve);
+    }
+  });
+}
+
+function _releaseFetchSlot() {
+  if (_fetchWaiters.length > 0) {
+    _fetchWaiters.shift()();
+  } else {
+    _concurrentFetches--;
+  }
+}
+
 // ─── Low-level fetch & decode ─────────────────────────────────────────────────
 
 async function _fetchBytes(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
-  return new Uint8Array(await res.arrayBuffer());
+  await _acquireFetchSlot();
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+    return new Uint8Array(await res.arrayBuffer());
+  } finally {
+    _releaseFetchSlot();
+  }
+}
+
+const _textDecoder = new TextDecoder();
+
+function _msgpackKeyConverter(key) {
+  // msgpack_numpy (Python) may emit binary keys (msgpack bin) for dict keys
+  // that are bytes objects. @msgpack/msgpack decodes those as Uint8Array, which
+  // then causes a "key must be string or number" error. Convert to string.
+  if (key instanceof Uint8Array) return _textDecoder.decode(key);
+  return key;
 }
 
 function _decodeMsgpack(bytes) {
-  return _decodeNumpy(decode(bytes));
+  return _decodeNumpy(decode(bytes, { mapKeyConverter: _msgpackKeyConverter }));
 }
 
 // ─── Bounding-box intersection ────────────────────────────────────────────────
