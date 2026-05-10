@@ -397,13 +397,18 @@ export class WebxtileLoader {
 
   async _loadTile(filename) {
     // 1. In-memory session cache
-    if (this._memCache.has(filename)) return this._memCache.get(filename);
+    if (this._memCache.has(filename)) {
+      const tile = this._memCache.get(filename);
+      if (!tile._filename) tile._filename = filename; // backfill for pre-existing entries
+      return tile;
+    }
 
     // 2. IndexedDB persistent cache (raw bytes stored → decode on retrieval)
     if (this._db) {
       const cached = await this._db.get('tiles', filename);
       if (cached instanceof Uint8Array) {
         const tile = _decodeMsgpack(cached);
+        tile._filename = filename;
         this._memCache.set(filename, tile);
         return tile;
       }
@@ -418,6 +423,7 @@ export class WebxtileLoader {
     }
 
     const tile = _decodeMsgpack(bytes);
+    tile._filename = filename;
     this._memCache.set(filename, tile);
     return tile;
   }
@@ -434,28 +440,67 @@ export class WebxtileLoader {
    * @param {number}        nSpatial  - 2 or 3
    * @returns {Promise<object[]>}
    */
-  async _collectTiles(filename, bbox, level, nSpatial) {
-    const tile = await this._loadTile(filename);
+  async _collectTiles(rootFilename, bbox, level, nSpatial) {
+    const collected = [];
+    // BFS frontier: process one level of the tree at a time in bounded batches.
+    // This avoids creating a promise for every node in the subtree upfront
+    // (the old recursive Promise.all caused ERR_INSUFFICIENT_RESOURCES for
+    // deep trees with high branching factor).
+    let frontier = [{ filename: rootFilename, groupId: -1 }];
+    // groups[id] tracks siblings spawned from the same parent so we can fall
+    // back to the parent tile when none of its children pass the bbox test.
+    const groups = []; // { fallback: tile, accepted: 0, remaining: N }
 
-    // Prune branches that don't intersect the query bbox
-    if (!_intersects(tile.bounds, bbox, nSpatial)) return [];
+    while (frontier.length > 0) {
+      const next = [];
 
-    const isLeaf    = tile.is_leaf ?? (tile.children == null);
-    const tileLevel = tile.level ?? 0;
+      // Process frontier in batches of 16 to allow parallel fetches without
+      // queuing millions of promises at once.
+      for (let i = 0; i < frontier.length; i += 16) {
+        const batch = frontier.slice(i, i + 16);
+        const tiles = await Promise.all(batch.map(({ filename }) => this._loadTile(filename)));
 
-    // Return this tile if it is a leaf or we have hit the requested depth
-    if (isLeaf || (level !== null && tileLevel >= level)) return [tile];
+        for (let j = 0; j < tiles.length; j++) {
+          const tile    = tiles[j];
+          const groupId = batch[j].groupId;
+          const group   = groupId >= 0 ? groups[groupId] : null;
+          const passes  = _intersects(tile.bounds, bbox, nSpatial);
 
-    // Recurse into children in parallel for throughput
-    const children = tile.children ?? [];
-    const childGroups = await Promise.all(
-      children.map(child => this._collectTiles(child, bbox, level, nSpatial))
-    );
-    const collected = childGroups.flat();
+          if (group) {
+            if (passes) group.accepted++;
+            if (--group.remaining === 0 && group.accepted === 0) {
+              // Every sibling was rejected by bbox → use the coarser parent tile.
+              collected.push(group.fallback);
+            }
+            if (!passes) continue;
+          } else if (!passes) {
+            continue;
+          }
 
-    // If the bbox filtered out all children, fall back to this (coarser) tile
-    // so the caller always receives at least a low-res result for the region
-    return collected.length > 0 ? collected : [tile];
+          const isLeaf    = tile.is_leaf ?? (tile.children == null);
+          const tileLevel = tile.level ?? 0;
+
+          if (isLeaf || (level !== null && tileLevel >= level)) {
+            collected.push(tile);
+            continue;
+          }
+
+          const children = tile.children ?? [];
+          if (children.length === 0) {
+            collected.push(tile);
+            continue;
+          }
+
+          const gid = groups.length;
+          groups.push({ fallback: tile, accepted: 0, remaining: children.length });
+          next.push(...children.map(fn => ({ filename: fn, groupId: gid })));
+        }
+      }
+
+      frontier = next;
+    }
+
+    return collected;
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
