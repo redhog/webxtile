@@ -338,12 +338,25 @@ export class WebxtileLoader {
    *   name.  Use a unique name per dataset if you serve multiple datasets from
    *   the same origin.
    */
-  constructor(baseUrl, { dbName = 'webxtile-cache' } = {}) {
+  constructor(baseUrl, { dbName = 'webxtile-cache', acquire = _acquireFetchSlot, release = _releaseFetchSlot } = {}) {
     this._base       = baseUrl.replace(/\/$/, '');
     this._dbName     = dbName;
     this._meta       = null;   // set by open()
     this._db         = null;   // IDBDatabase, set by open()
     this._memCache   = new Map(); // filename → decoded tile (session-level)
+    this._acquire    = acquire;
+    this._release    = release;
+  }
+
+  async _fetchBytes(url) {
+    await this._acquire();
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+      return new Uint8Array(await res.arrayBuffer());
+    } finally {
+      this._release();
+    }
   }
 
   // ── Initialisation ──────────────────────────────────────────────────────────
@@ -378,7 +391,7 @@ export class WebxtileLoader {
   // ── Tile fetch and cache ────────────────────────────────────────────────────
 
   async _fetchAndDecode(filename) {
-    const bytes = await _fetchBytes(`${this._base}/${filename}`);
+    const bytes = await this._fetchBytes(`${this._base}/${filename}`);
     return _decodeMsgpack(bytes);
   }
 
@@ -397,7 +410,7 @@ export class WebxtileLoader {
     }
 
     // 3. Network fetch
-    const bytes = await _fetchBytes(`${this._base}/${filename}`);
+    const bytes = await this._fetchBytes(`${this._base}/${filename}`);
 
     // Persist raw bytes for future use; ignore quota errors silently
     if (this._db) {
