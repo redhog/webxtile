@@ -1,6 +1,6 @@
 {
   "name": "webxtile",
-  "version": "0.0.4",
+  "version": "0.0.7",
   "description": "Browser client for the webxtile octree format — partial bbox loads for web visualisation",
   "type": "module",
   "main": "webxtile.js",
@@ -23,8 +23,15 @@
     "level-of-detail",
     "lod"
   ],
+  "scripts": {
+    "test:browser": "playwright test"
+  },
   "dependencies": {
     "@msgpack/msgpack": "^3.0.0",
     "idb": "^8.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.44.0",
+    "esbuild": "^0.21.0"
   }
 }
