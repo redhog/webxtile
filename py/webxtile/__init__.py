@@ -77,8 +77,9 @@ def write_webxtile(
     max_leaf:
         Maximum grid points per tile along any spatial dimension.  Tiles
         smaller than this threshold become leaf nodes.  When ``None``
-        (default), chosen automatically: 4096 for 2-D datasets, 256 for
-        3-D datasets, targeting ~16 M points per leaf tile.
+        (default), chosen automatically: 128 for 2-D datasets, 32 for
+        3-D datasets, targeting ~25 K points per leaf tile (fits within
+        the ~200 K point/frame WebGL rendering budget with ~8 tiles in view).
     crs:
         Horizontal CRS identifier (e.g. ``"EPSG:3857"``).  When omitted,
         the code is auto-detected from CF ``grid_mapping`` variables,
@@ -99,7 +100,7 @@ def write_webxtile(
         )
 
     if max_leaf is None:
-        max_leaf = 256 if len(spatial_dims) == 3 else 4096
+        max_leaf = 32 if len(spatial_dims) == 3 else 128
 
     crs, z_crs, crs_cf_attrs, z_crs_cf_attrs = _resolve_crs_for_write(
         ds, crs, z_crs
