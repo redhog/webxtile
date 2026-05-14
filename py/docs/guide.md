@@ -90,17 +90,24 @@ webxtile.write_webxtile(ds, "tiles/", spatial_dims=["easting", "northing"])
 
 ### Tuning tile size
 
-`max_leaf` controls the granularity of the spatial tree.  Smaller values create more tiles (better spatial filtering, more files); larger values create fewer, bigger tiles.
+`max_leaf` is the maximum number of grid points along any single spatial axis in a leaf tile — not the total point count. A 2-D leaf tile can hold up to `max_leaf × max_leaf` points; a 3-D leaf tile up to `max_leaf³`.
+
+When `max_leaf=None` (the default), it is chosen automatically to target ~16 M points per leaf tile:
+
+- **2-D quadtree**: `max_leaf = 4096` (4096² ≈ 16 M points)
+- **3-D octree**: `max_leaf = 256` (256³ ≈ 16 M points)
+
+This default is sized for browser rendering workloads. Override it explicitly if you have different requirements:
 
 ```python
-# finer tiles – good for large datasets with selective queries
-webxtile.write_webxtile(ds, "tiles/", max_leaf=16)
+# fine tiles – more spatial selectivity, more HTTP requests
+webxtile.write_webxtile(ds, "tiles/", max_leaf=128)
 
-# coarser tiles – fewer files, faster for whole-dataset reads
-webxtile.write_webxtile(ds, "tiles/", max_leaf=64)
+# coarse tiles – fewer requests, less spatial selectivity
+webxtile.write_webxtile(ds, "tiles/", max_leaf=512)
 ```
 
-Rule of thumb: choose `max_leaf` so that each leaf tile fits comfortably in memory for a single frontend render call (e.g. 32–128 points per axis).  The same guidance applies for both quadtree and octree datasets.
+Larger `max_leaf` values produce a shallower tree with fewer tiles and fewer HTTP round-trips, at the cost of coarser LOD steps and reduced spatial filtering granularity.
 
 ### Attaching CRS information
 
@@ -117,7 +124,7 @@ webxtile.write_webxtile(
 ### xarray accessor
 
 ```python
-ds.webxtile.to_webxtile("tiles/", max_leaf=32, crs="EPSG:3857")
+ds.webxtile.to_webxtile("tiles/", crs="EPSG:3857")
 ```
 
 ---

@@ -8,7 +8,7 @@ webxtile.write_webxtile(
     path: str | Path,
     *,
     spatial_dims: list[str] | None = None,
-    max_leaf: int = 32,
+    max_leaf: int | None = None,
     crs: str | None = None,
     z_crs: str | None = None,
 ) -> None
@@ -26,7 +26,7 @@ Write an xarray Dataset to a webxtile directory.  The tree structure is chosen a
 | `ds` | `xr.Dataset` | Dataset to write. Must have 2 or 3 spatial dimensions. All data variables and coordinates are preserved. |
 | `path` | `str \| Path` | Output directory. Created (including parents) if it does not exist. |
 | `spatial_dims` | `list[str] \| None` | Names of the 2 or 3 dimensions to use for spatial decomposition, e.g. `["x", "y", "z"]` (octree) or `["x", "y"]` (quadtree). The length of this list determines the tree type. Auto-detected from CF `axis` / `standard_name` attributes when `None`. See [CF detection rules](#cf-dimension-auto-detection). |
-| `max_leaf` | `int` | Maximum grid points per tile along any single spatial axis. A tile whose largest spatial axis has ≤ `max_leaf` points becomes a leaf (full-resolution) node. Default `32`. |
+| `max_leaf` | `int \| None` | Maximum grid points per tile along any single spatial axis. A tile whose largest spatial axis has ≤ `max_leaf` points becomes a leaf (full-resolution) node. When `None` (default), chosen automatically based on dimensionality: `4096` for 2-D quadtree datasets, `256` for 3-D octree datasets, targeting ~16 M points per leaf tile. |
 | `crs` | `str \| None` | Horizontal CRS identifier (e.g. `"EPSG:3857"`). Stored in `metadata.msgpack` for downstream consumers; not used by the library itself. |
 | `z_crs` | `str \| None` | Vertical CRS identifier (e.g. `"EPSG:4979"`). Stored in metadata only. Only meaningful for 3-D (octree) datasets; pass `None` for 2-D datasets. |
 

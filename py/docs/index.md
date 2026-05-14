@@ -18,7 +18,7 @@ Supports full roundtrip with [xarray](https://xarray.dev) Datasets following [CF
 import webxtile, xarray as xr
 
 # Write
-webxtile.write_webxtile(ds, "tiles/", max_leaf=32, crs="EPSG:3857")
+webxtile.write_webxtile(ds, "tiles/", crs="EPSG:3857")
 
 # Read — full resolution
 ds = webxtile.read_webxtile("tiles/")

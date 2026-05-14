@@ -58,7 +58,7 @@ def write_webxtile(
     path: str | Path,
     *,
     spatial_dims: list[str] | None = None,
-    max_leaf: int = 32,
+    max_leaf: int | None = None,
     crs: str | None = None,
     z_crs: str | None = None,
 ) -> None:
@@ -76,7 +76,9 @@ def write_webxtile(
         not provided.
     max_leaf:
         Maximum grid points per tile along any spatial dimension.  Tiles
-        smaller than this threshold become leaf nodes.
+        smaller than this threshold become leaf nodes.  When ``None``
+        (default), chosen automatically: 4096 for 2-D datasets, 256 for
+        3-D datasets, targeting ~16 M points per leaf tile.
     crs:
         Horizontal CRS identifier (e.g. ``"EPSG:3857"``).  When omitted,
         the code is auto-detected from CF ``grid_mapping`` variables,
@@ -95,6 +97,9 @@ def write_webxtile(
         raise ValueError(
             f"spatial_dims must have 2 or 3 elements, got {spatial_dims}"
         )
+
+    if max_leaf is None:
+        max_leaf = 256 if len(spatial_dims) == 3 else 4096
 
     crs, z_crs, crs_cf_attrs, z_crs_cf_attrs = _resolve_crs_for_write(
         ds, crs, z_crs
@@ -506,9 +511,13 @@ def _build_metadata(
     if z_crs is not None and "epsg_z_code" not in global_attrs:
         global_attrs["epsg_z_code"] = z_crs
 
+    spatial_coords = _spatial_coord_arrays(ds, spatial_dims)
+    global_bounds = _bounds_from_spatial_coords(spatial_coords, spatial_dims)
+
     return {
         "version":        _FORMAT_VERSION,
         "root_tile":      _ROOT_TILE,
+        "bounds":         global_bounds,
         "spatial_dims":   list(spatial_dims),
         "crs":            crs,
         "z_crs":          z_crs,

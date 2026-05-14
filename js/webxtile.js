@@ -517,18 +517,19 @@ export class WebxtileLoader {
    * Fetch tiles for a bbox query without traversing intermediate levels.
    *
    * Algorithm:
-   *   1. Fetch the root tile (needed for its bounds).
+   *   1. Read global bounds from metadata (no network fetch required).
    *   2. Generate candidate filenames at `level` by recursively halving the
    *      root bounds and keeping only those that intersect `bbox`.
    *   3. Batch-fetch all candidates in parallel (16 at a time).
    *   4. For each candidate that returned 404, walk up the parent chain
    *      (_parentFilename strips one _N suffix per step) until an existing
    *      tile is found.  A Set deduplicates ancestors shared by multiple
-   *      missing candidates.
+   *      missing candidates.  The root tile is fetched lazily only if the
+   *      fallback walk reaches it.
    *
-   * This means only two sequential round trips regardless of tree depth:
-   * one for the root, one for the target-level batch.  Parent fallback adds
-   * at most one additional sequential hop per 404 cluster.
+   * This means only one sequential round trip for any level > 0: the
+   * target-level batch.  Parent fallback adds at most one additional
+   * sequential hop per 404 cluster.
    *
    * @param {string}        rootFilename
    * @param {number[]|null} bbox     - spatial filter; null = no filter
@@ -537,15 +538,17 @@ export class WebxtileLoader {
    * @returns {Promise<object[]>}
    */
   async _collectBBox(rootFilename, bbox, level, nSpatial) {
-    const rootTile = await this._loadTile(rootFilename);
-    if (!_intersects(rootTile.bounds, bbox, nSpatial)) return [];
-    if (level === 0) return [rootTile];
+    const rootBounds = this._meta.bounds;
+    if (!_intersects(rootBounds, bbox, nSpatial)) return [];
 
-    const candidates = _candidatesAtLevel(rootFilename, rootTile.bounds, bbox, level, nSpatial);
+    if (level === 0) {
+      return [await this._loadTile(rootFilename)];
+    }
+
+    const candidates = _candidatesAtLevel(rootFilename, rootBounds, bbox, level, nSpatial);
 
     // seen: filename → tile (null means confirmed 404)
-    // Pre-seed root so the parent-walk always terminates.
-    const seen = new Map([[rootFilename, rootTile]]);
+    const seen = new Map();
 
     // Batch-fetch all candidates in parallel.
     for (let i = 0; i < candidates.length; i += 16) {
@@ -560,14 +563,18 @@ export class WebxtileLoader {
       let fn = candidate;
       while (seen.get(fn) == null) {               // null (404) or unseen
         const parent = _parentFilename(fn);
-        if (parent === null) { fn = rootFilename; break; }  // hit root
+        if (parent === null) {
+          // fn is root; fetch it lazily if not yet seen
+          if (!seen.has(fn)) seen.set(fn, await this._loadTileOrNull(fn));
+          break;
+        }
         if (!seen.has(parent)) seen.set(parent, await this._loadTileOrNull(parent));
         fn = parent;
       }
-      resultFiles.add(fn);
+      if (seen.get(fn) != null) resultFiles.add(fn);
     }
 
-    return [...resultFiles].map(fn => seen.get(fn));
+    return [...resultFiles].map(fn => seen.get(fn)).filter(Boolean);
   }
 
   /**
