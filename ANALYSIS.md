@@ -17,14 +17,27 @@ dataset/
 
 ### Tree Structure
 
-| Dimensionality | Tree type | Branching factor |
-|----------------|-----------|-----------------|
-| 2D             | Quadtree  | 4               |
-| 3D             | Octree    | 8               |
+Splitting happens at the **index midpoint** of each spatial axis (not the coordinate midpoint). Two independent termination conditions apply:
 
-Splitting happens at the **index midpoint** of each spatial axis (not the coordinate midpoint). Recursion terminates when the largest spatial axis ≤ `max_leaf` (default: 32 points).
+- **Per-axis**: axis `a` is split only if its physical coordinate span exceeds the **globally minimum physical span across all axes at the root** (a fixed threshold, computed once at write time). Axes at or below this threshold are never split.
+- **Global leaf**: node becomes a leaf when `max(all axis sizes) ≤ max_leaf`.
 
-Child index layout (2D quadtree):
+The branching factor emerges from how many axes exceed the root's minimum physical span:
+
+| Axes being split | Branching | Effective tree type |
+|-----------------|-----------|---------------------|
+| 3               | 8         | Octree              |
+| 2               | 4         | Quadtree            |
+| 1               | 2         | Binary tree         |
+| 0               | —         | Leaf                |
+
+**Why a fixed root threshold, not a per-node comparison**: comparing each axis to the *current node's* minimum changes as you descend — the minimum span shifts as large axes get halved — producing octree splits at the top levels and quadtree only deep in the tree. For geophysics this is backwards. The root's minimum physical span is a stable global property of the dataset geometry and gives correct, consistent results throughout the tree.
+
+**Why physical extent, not grid point count**: a typical AEM dataset might be 50 km × 100 km × 500 m. At 10 m vertical spacing: 500×1000×50 grid points (z is min in grid counts — happens to work). At 1 cm vertical spacing: 500×1000×50,000 grid points — now z is the *maximum* in grid counts, so a grid-count rule splits z first at every level. The physical-extent rule sees 500 m depth vs 50–100 km horizontal in both cases and correctly suppresses z-splits regardless of vertical resolution.
+
+**Result for geophysics**: the physical z extent (hundreds of metres) is always far smaller than horizontal extent (tens of kilometres), so z is never split — the tree is a **pure quadtree throughout** — tiles cover the full depth column at every level of detail, which is exactly what plan-view and cross-section rendering require.
+
+Child index layout (example for quadtree node):
 ```
 0: x[0:xm],  y[0:ym]     1: x[0:xm],  y[ym:ny]
 2: x[xm:nx], y[0:ym]     3: x[xm:nx], y[ym:ny]
@@ -180,18 +193,35 @@ The response body is raw msgpack bytes — identical to what the current decoder
 
 ---
 
-### S3 — Subtree Bundling (latency reduction for `streamLeaves()`)
+### S3 — Subtree Bundling (latency reduction + rendering/network decoupling)
 
-**Problem**: `streamLeaves()` (full BFS traversal used to progressively load the entire dataset) requires O(depth) sequential round-trips because it follows the `children` array in each tile to discover the next level.
+**Problems addressed**:
 
-`loadBBox()` is **not affected** by this problem: since `metadata.msgpack` now carries global bounds, candidate filenames at the target level are computed from the naming scheme alone and fetched in a single parallel batch (one round-trip for level > 0). S3 therefore provides no latency benefit for `loadBBox()` on regular grids. On irregular grids where coordinate midpoints diverge significantly from index midpoints, S3 would eliminate the occasional 404-and-parent-fallback hops, but these are minor compared to the main tile fetch.
+1. `streamLeaves()` requires O(depth) sequential round-trips because it follows `children` arrays level by level.
+2. Network-optimal tile size (~16M points, ~200 MB) and GPU-optimal tile size (tens to hundreds of thousands of points per draw call) are in direct conflict. 200 MB fits comfortably in browser RAM but not in GPU memory; the GPU needs many small upload chunks, but each HTTP request carries significant overhead.
 
-**Solution**: bundle a root tile together with all its descendants into a single file. One HTTP request returns the entire subtree. This is the approach PMTiles uses for map vector tiles.
+`loadBBox()` is **not affected** by the latency problem: candidate filenames are computed from the naming scheme and fetched in a single parallel batch. S3 provides no latency benefit for `loadBBox()` on regular grids.
 
-- For `streamLeaves()`: reduces sequential round-trips from O(depth) to O(1) — the entire tree arrives in one or a few bundles.
-- For `loadBBox()`: no meaningful benefit on regular grids; marginal reduction in 404 overhead on irregular grids.
+**Solution**: bundle a subtree into a single msgpack file with two levels baked in at write time:
 
-This requires a more significant redesign of both the writer (grouping tiles into bundles) and the reader (unpacking a bundle into the tile cache in one pass), but the msgpack format per tile remains unchanged.
+```
+{
+  "bounds": [...],          # bundle-level AABB
+  "level": 0,               # tree depth of bundle root
+  "sub_tiles": [            # GPU-sized rendering chunks, pre-sorted
+    { "bounds": [...], "shape": [...], "spatial_coords": {...}, "variables": {...} },
+    { "bounds": [...], "shape": [...], "spatial_coords": {...}, "variables": {...} },
+    ...
+  ]
+}
+```
+
+- **Outer level** (network granularity): one HTTP fetch per bundle, ~200 MB. One round-trip for `streamLeaves()` instead of O(depth).
+- **Inner level** (GPU granularity): pre-partitioned, pre-sorted rendering sub-tiles packed as msgpack array fields. No byte-offset index needed — the client decodes the full msgpack into RAM (~200 MB, fine), then streams sub-tiles to the GPU one at a time.
+
+The spatial partitioning and sorting of sub-tiles is done **once at write time**, not per client fetch. This is efficient because write-once / read-many: the client pays zero CPU for partitioning, just iterates the array and uploads.
+
+**Interaction with S0**: increasing `max_leaf` to reduce tile count is only safe because this bundle structure handles rendering granularity independently. Without S3, large `max_leaf` values would produce tiles that are too large to upload to the GPU in one buffer.
 
 ---
 
@@ -234,13 +264,78 @@ This requires a more significant redesign of both the writer (grouping tiles int
 
 ---
 
+### S8 — Existence Manifest Pyramid for Holey Grids
+
+**Problem**: datasets with non-uniform spatial coverage ("holey" grids) degrade `loadBBox()` in two ways:
+
+1. **False-positive candidates**: the naming-scheme heuristic generates candidate filenames for regions where no data exists. Each miss becomes a 404, triggering a parent fallback — one additional sequential round-trip per 404 cluster. In a sparse dataset (e.g., survey lines covering 10% of the bounding box) most candidates miss, so nearly every `loadBBox()` call incurs several sequential fallback hops instead of a single parallel batch.
+
+2. **Flat manifest is impractical at scale**: simply listing all existing tile names in `metadata.msgpack` solves the 404 problem but blows up metadata size — 340K tiles × ~25 bytes/name ≈ 8 MB. Fetching 8 MB upfront on every page load to discover which tiles exist defeats the purpose of a tile pyramid.
+
+**When this does NOT matter**: dense, uniform grids (all candidate filenames resolve to real tiles, 404 rate near zero). The current speculative approach works well there.
+
+**Solution**: a separate, shallow "existence manifest pyramid" — a second pyramid of small msgpack files where each file lists the real data tile names within its spatial bounds.
+
+```
+dataset/
+  metadata.msgpack          # unchanged
+  root.msgpack              # unchanged
+  root_0_1_3.msgpack        # unchanged
+  ...
+  manifest/
+    m_root.msgpack          # covers entire dataset
+    m_root_0.msgpack        # covers quadrant 0
+    m_root_0_0.msgpack      # covers quadrant 0,0
+    m_root_0_1.msgpack      # ...
+```
+
+Each manifest tile is a small msgpack object:
+
+```
+{
+  "bounds": [x_min, y_min, z_min, x_max, y_max, z_max],
+  "tiles": ["root.msgpack", "root_0.msgpack", "root_0_0.msgpack", ...]
+}
+```
+
+**Pyramid depth is fixed and shallow** (e.g., 2–3 levels), independent of the data pyramid depth. The manifest pyramid does not need to match the data pyramid's branching: it needs only enough levels to keep individual manifest tiles small. Example sizing at depth 3 for a 340K-tile dataset:
+
+| Manifest depth | Manifest tiles | Data tiles per manifest tile | Manifest tile size |
+|---------------|---------------|-----------------------------|--------------------|
+| 2 levels      | ~21            | ~16,000                     | ~400 KB            |
+| 3 levels      | ~85            | ~4,000                      | ~100 KB            |
+| 4 levels      | ~341           | ~1,000                      | ~25 KB             |
+
+Depth 3 is a reasonable default: 85 manifest tiles total, ~100 KB each — fetching 1–4 of them per `loadBBox()` query costs ~100–400 KB versus the current approach of many sequential fallback hops.
+
+**Query flow with the manifest pyramid**:
+
+1. Determine which manifest tiles cover the query bbox (typically 1–4 tiles at the right manifest level). Their names follow the same `m_root_i_j.msgpack` naming scheme, computable directly from bounds — no sequential traversal.
+2. Fetch those manifest tiles in parallel (one round-trip).
+3. Take the union of their `tiles` arrays, filter to tiles intersecting the query bbox and target zoom level.
+4. Fetch exactly those tiles in parallel — no 404s, no fallback hops.
+
+Total round-trips for `loadBBox()`: **2** (manifest batch + data batch) instead of 1 + O(fallback hops).
+
+**Write-time cost**: one additional pass over the tile tree at write time, building manifest objects bottom-up. Negligible compared to data tile generation.
+
+**Interaction with S2**: S2's `index.msgpack` already maps every tile name to a byte offset, so it implicitly lists all existing tiles. For small datasets, the client could use S2's flat index as a substitute — fetch the full index once, parse it, then filter by bbox. However, S2's index is not spatially indexed; for large sparse datasets the client must download and parse the entire index (potentially many MB) before filtering. The manifest pyramid is the spatially-indexed counterpart: pay only for the regions you query.
+
+**Interaction with S3**: if S3 (subtree bundling) is in use, the manifest tiles list bundle names instead of individual tile names — entries are fewer and larger, keeping manifest tiles even smaller.
+
+**When to implement**: only worthwhile for datasets where coverage is significantly non-uniform (survey-line data, coastal datasets, multi-epoch composites with gaps). Dense raster grids covering their full bounding box gain nothing; the current speculative naming scheme has near-zero 404 rate for those.
+
+---
+
 ### Priority Recommendation
 
 For the Nagelfluh use case (geophysics grids, browser-based visualization):
 
-1. **S0** (increase `max_leaf`) — zero code changes; tune at write time. Use `max_leaf=256` for 3D, `max_leaf=4096` for 2D to target ~16M points per tile.
-2. **S3** (subtree bundling) — primarily benefits `streamLeaves()` (O(depth) → O(1) round-trips); no meaningful gain for `loadBBox()` on regular grids. Lower priority now that `loadBBox()` already achieves one round-trip.
-3. **S5** (IndexedDB LRU) — low effort, prevents silent quota exhaustion.
-4. **S4** (streaming `toScatter()`) — important once datasets grow beyond single-session memory.
-5. **S2** (single-file archive) — operational win for large deployments; no browser benefit.
-6. **S1** (directory sharding) — quick defensive fix if S2 is deferred.
+1. **S3** (subtree bundling with embedded GPU sub-tiles) — solves both `streamLeaves()` latency (O(depth) → O(1) round-trips) and the rendering/network tile size conflict. Pre-partitioned sub-tiles in the bundle eliminate client-side partitioning work. Required before S0 is safe to use at large `max_leaf` values.
+2. **S0** (increase `max_leaf`) — tune at write time once S3 is in place. Use `max_leaf=256` for 3D, `max_leaf=4096` for 2D to target ~16M points per network bundle.
+3. **Adaptive axis splitting** (writer change) — split axis `a` only if its physical span exceeds the globally minimum physical span at the root (fixed threshold, computed once). A per-node comparison (current min) produces octs at the top levels and quads only deep in the tree — the wrong order for geophysics. A grid-count comparison breaks entirely at fine vertical resolution (1 cm bins give z 50,000 points, making it the maximum, not minimum). The fixed physical threshold gives a pure quadtree for flat datasets regardless of discretization. No format or reader changes required.
+4. **S5** (IndexedDB LRU) — low effort, prevents silent quota exhaustion.
+5. **S4** (streaming `toScatter()`) — important once datasets grow beyond single-session memory.
+6. **S8** (existence manifest pyramid) — implement when datasets have non-uniform spatial coverage (survey lines, coastal data, gapped composites). Eliminates 404 fallback hops for holey grids at the cost of one extra parallel round-trip per `loadBBox()` call.
+7. **S2** (single-file archive) — operational win for large deployments; no browser benefit.
+8. **S1** (directory sharding) — quick defensive fix if S2 is deferred.
