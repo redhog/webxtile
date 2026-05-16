@@ -110,23 +110,32 @@ function _parentFilename(filename) {
 
 /**
  * Generate filenames of all tiles at `targetLevel` whose approximate bbox
- * intersects `bbox`.  Bounds are computed by halving each axis at its
- * coordinate midpoint — an approximation of the true index-midpoint split.
- * False positives (extra 404 requests) are harmless; false negatives cannot
- * occur because the caller's parent-fallback walk covers any missed tiles.
+ * intersects `bbox`.  Only axes in `splitAxes` are halved at each level;
+ * non-split axes inherit the full parent bounds.
+ *
+ * @param {string}   rootFilename
+ * @param {number[]} rootBounds   - always 6 elements [x0,y0,z0,x1,y1,z1]
+ * @param {number[]|null} bbox
+ * @param {number}   targetLevel
+ * @param {string[]} spatialDims  - e.g. ["x","y","z"]
+ * @param {string[]} splitAxes    - subset of spatialDims
+ * @returns {string[]}
  */
-function _candidatesAtLevel(rootFilename, rootBounds, bbox, targetLevel, nSpatial) {
-  const branchFactor = 1 << nSpatial;          // 4 for 2-D, 8 for 3-D
-  const rootStem     = rootFilename.replace(/\.msgpack$/, '');
-  const out          = [];
+function _candidatesAtLevel(rootFilename, rootBounds, bbox, targetLevel, spatialDims, splitAxes) {
+  const nSplit      = splitAxes.length;
+  const branchFactor = 1 << nSplit;
+  const nSpatial    = spatialDims.length;
+  const rootStem    = rootFilename.replace(/\.msgpack$/, '');
+  const out         = [];
 
   function recurse(stem, bounds, depth) {
     if (!_intersects(bounds, bbox, nSpatial)) return;
     if (depth === targetLevel) { out.push(stem + '.msgpack'); return; }
     for (let ci = 0; ci < branchFactor; ci++) {
       const cb = bounds.slice();
-      for (let d = 0; d < nSpatial; d++) {
-        const bit = nSpatial - 1 - d;           // X = MSB, Z = LSB
+      for (let si = 0; si < nSplit; si++) {
+        const d   = spatialDims.indexOf(splitAxes[si]);
+        const bit = nSplit - 1 - si;             // splitAxes[0] = MSB
         const mid = (bounds[d] + bounds[d + 3]) / 2;
         if ((ci >> bit) & 1) cb[d]     = mid;   // upper half
         else                 cb[d + 3] = mid;   // lower half
@@ -137,6 +146,33 @@ function _candidatesAtLevel(rootFilename, rootBounds, bbox, targetLevel, nSpatia
 
   recurse(rootStem, rootBounds, 0);
   return out;
+}
+
+// ─── Manifest bitmap helpers ──────────────────────────────────────────────────
+
+/**
+ * Return true if bit `index` is set in `bitmap` (Uint8Array or plain bytes).
+ */
+function _tileExists(bitmap, index) {
+  return (bitmap[index >> 3] & (1 << (index & 7))) !== 0;
+}
+
+/**
+ * Compute the BFS index of a tile within a manifest subtree.
+ *
+ * @param {string[]} childParts - child-index digits from manifest root to target
+ *   e.g. ["0","2","1"] means root → child 0 → child 2 → child 1
+ * @param {number}   branch     - branching factor (4 for quadtree, 8 for octree)
+ * @returns {number}
+ */
+function _bfsTileIndexIter(childParts, branch) {
+  const L = childParts.length;
+  let levelStart = 0;
+  let b = 1;
+  for (let l = 0; l < L; l++) { levelStart += b; b *= branch; }
+  let pos = 0;
+  for (const part of childParts) { pos = pos * branch + parseInt(part, 10); }
+  return levelStart + pos;
 }
 
 // ─── Low-level fetch & decode ─────────────────────────────────────────────────
@@ -183,6 +219,7 @@ function _intersects(tileBounds, bbox, nSpatial) {
  * The two main entry points for data consumption are:
  *   - `toScatter()` — flat parallel arrays per dimension and variable,
  *     suitable for point-cloud or scatter-plot style WebGL rendering.
+ *   - `subTiles()` — iterate GPU-sized sub-tiles from all loaded tiles.
  *   - `getCoord(dimName)` — merged sorted coordinate values for one dim.
  *   - `tiles` / `meta` — raw access for custom processing.
  */
@@ -208,6 +245,9 @@ export class WebxtileResult {
    * @type {string[]}
    */
   get spatialDims() { return this._meta.spatial_dims; }
+
+  /** Axes that are split at each tree level (subset of spatialDims). */
+  get splitAxes() { return this._meta.split_axes ?? this._meta.spatial_dims; }
 
   /** Horizontal CRS identifier string or null. */
   get crs()  { return this._meta.crs  ?? null; }
@@ -249,6 +289,29 @@ export class WebxtileResult {
     }
     vals.sort((a, b) => a - b);
     return new Float64Array(vals);
+  }
+
+  /**
+   * Iterate GPU-sized sub-tiles from all loaded tiles.
+   *
+   * Falls back to the tile itself when no sub_tiles field is present (e.g.
+   * internal tiles or datasets written without gpu_tile_size).
+   *
+   * @yields {{ bounds, shape, spatial_coords, variables }}
+   */
+  *subTiles() {
+    for (const tile of this._tiles) {
+      if (tile.sub_tiles?.length > 0) {
+        yield* tile.sub_tiles;
+      } else {
+        yield {
+          bounds:         tile.bounds,
+          shape:          tile.shape,
+          spatial_coords: tile.spatial_coords,
+          variables:      tile.variables,
+        };
+      }
+    }
   }
 
   /**
@@ -511,7 +574,44 @@ export class WebxtileLoader {
     return tile;
   }
 
+  /**
+   * Load a manifest tile (from the manifest/ subdirectory), returning null on 404.
+   * Manifest tiles are NOT cached in IDB — they are small and may be re-written.
+   */
+  async _loadManifestOrNull(filename) {
+    const url   = `${this._base}/manifest/${filename}`;
+    const bytes = await this._fetchBytesOrNull(url);
+    if (bytes === null) return null;
+    return _decodeMsgpack(bytes);
+  }
+
   // ── Octree traversal ────────────────────────────────────────────────────────
+
+  /**
+   * Collect tiles by following children arrays (tree traversal).
+   * Used when level is null (full resolution) or for any case where
+   * candidate names are not known via the naming scheme.
+   *
+   * @param {string}        filename
+   * @param {number[]|null} bbox
+   * @param {number}        nSpatial
+   * @returns {Promise<object[]>}
+   */
+  async _collectByTraversal(filename, bbox, nSpatial) {
+    const tile = await this._loadTileOrNull(filename);
+    if (!tile) return [];
+    if (!_intersects(tile.bounds, bbox, nSpatial)) return [];
+
+    const isLeaf = tile.is_leaf ?? (!tile.children || tile.children.length === 0);
+    if (isLeaf) return [tile];
+
+    const children = tile.children ?? [];
+    const childResults = await Promise.all(
+      children.map(fn => this._collectByTraversal(fn, bbox, nSpatial))
+    );
+    const flat = childResults.flat();
+    return flat.length > 0 ? flat : [tile];
+  }
 
   /**
    * Fetch tiles for a bbox query without traversing intermediate levels.
@@ -527,9 +627,8 @@ export class WebxtileLoader {
    *      missing candidates.  The root tile is fetched lazily only if the
    *      fallback walk reaches it.
    *
-   * This means only one sequential round trip for any level > 0: the
-   * target-level batch.  Parent fallback adds at most one additional
-   * sequential hop per 404 cluster.
+   * When manifest_depth is set in metadata, the manifest is consulted first
+   * to filter candidates, eliminating 404 requests for sparse datasets.
    *
    * @param {string}        rootFilename
    * @param {number[]|null} bbox     - spatial filter; null = no filter
@@ -538,19 +637,55 @@ export class WebxtileLoader {
    * @returns {Promise<object[]>}
    */
   async _collectBBox(rootFilename, bbox, level, nSpatial) {
-    const rootBounds = this._meta.bounds;
+    const rootBounds  = this._meta.bounds;
     if (!_intersects(rootBounds, bbox, nSpatial)) return [];
 
     if (level === 0) {
       return [await this._loadTile(rootFilename)];
     }
 
-    const candidates = _candidatesAtLevel(rootFilename, rootBounds, bbox, level, nSpatial);
+    const spatialDims  = this._meta.spatial_dims;
+    const splitAxes    = this._meta.split_axes ?? spatialDims;
+    const candidates   = _candidatesAtLevel(rootFilename, rootBounds, bbox, level, spatialDims, splitAxes);
+    const manifestDepth = this._meta.manifest_depth ?? null;
 
-    // seen: filename → tile (null means confirmed 404)
+    if (manifestDepth != null) {
+      // Try manifest-guided fetch to avoid 404s.
+      const mLevel        = Math.max(0, level - manifestDepth);
+      const mCandidates   = _candidatesAtLevel(rootFilename, rootBounds, bbox, mLevel, spatialDims, splitAxes);
+      const branch        = 1 << splitAxes.length;
+
+      const mTiles = await Promise.all(
+        mCandidates.map(fn => this._loadManifestOrNull('m_' + fn))
+      );
+
+      if (mTiles.some(m => m !== null)) {
+        // Filter data candidates using bitmaps.
+        const existingCandidates = candidates.filter(candidate => {
+          const stem = candidate.replace(/\.msgpack$/, '');
+          for (let mi = 0; mi < mCandidates.length; mi++) {
+            const mTile = mTiles[mi];
+            if (!mTile) continue;
+            const mRoot = (mTile.root ?? mCandidates[mi]).replace(/\.msgpack$/, '');
+            if (!stem.startsWith(mRoot)) continue;
+            const suffix = stem.slice(mRoot.length);
+            const parts  = suffix ? suffix.split('_').slice(1) : [];
+            if (parts.length > manifestDepth) continue;
+            const idx = _bfsTileIndexIter(parts, branch);
+            return _tileExists(mTile.tiles, idx);
+          }
+          return true; // no manifest tile covers this candidate → optimistic
+        });
+
+        const tiles = await Promise.all(existingCandidates.map(fn => this._loadTile(fn)));
+        return tiles.filter(Boolean);
+      }
+      // Fall through to speculative fetch when all manifest tiles were 404.
+    }
+
+    // Speculative fetch: batch-load candidates, fall back up parent chain for 404s.
     const seen = new Map();
 
-    // Batch-fetch all candidates in parallel.
     for (let i = 0; i < candidates.length; i += 16) {
       const batch = candidates.slice(i, i + 16).filter(fn => !seen.has(fn));
       const tiles = await Promise.all(batch.map(fn => this._loadTileOrNull(fn)));
@@ -644,11 +779,13 @@ export class WebxtileLoader {
   /**
    * Load tiles intersecting `bbox` at octree depth `level`.
    *
+   * When `level` is omitted or null, a full tree traversal following
+   * children arrays is used (full resolution, all leaf tiles).  Use
+   * `streamLeaves()` instead for background progressive loading.
+   *
    * For branches that terminate above `level` the deepest available tile is
    * used.  For branches where no child passes the bbox filter the coarser
    * parent is used as a fallback.
-   *
-   * To progressively load the full dataset to leaves use `streamLeaves()`.
    *
    * @param {number[]|null} bbox
    *   Spatial bounding box in the same CRS as the dataset.
@@ -656,20 +793,27 @@ export class WebxtileLoader {
    *   - 3-D: `[x_min, y_min, z_min, x_max, y_max, z_max]`
    *   Pass `null` for no spatial filter (whole dataset at this level).
    *
-   * @param {number} level
+   * @param {number|null} [level]
    *   Octree depth to descend to.  0 = root tile only (coarsest overview).
+   *   Omit or pass null for full resolution via tree traversal.
    *
    * @returns {Promise<WebxtileResult>}
    */
   async loadBBox(bbox, level) {
     if (!this._meta) throw new Error('Call open() before loadBBox()');
-    if (level == null) throw new Error('loadBBox() requires an explicit level. Use streamLeaves() to load all leaves.');
 
     this._bboxActive++;
     try {
       const nSpatial = this._meta.spatial_dims.length;
       const rootFile = this._meta.root_tile ?? 'root.msgpack';
-      const tiles    = await this._collectBBox(rootFile, bbox, level, nSpatial);
+
+      let tiles;
+      if (level == null) {
+        // Full resolution: traverse tree following children arrays.
+        tiles = await this._collectByTraversal(rootFile, bbox, nSpatial);
+      } else {
+        tiles = await this._collectBBox(rootFile, bbox, level, nSpatial);
+      }
       return new WebxtileResult(this._meta, tiles);
     } finally {
       this._bboxActive--;

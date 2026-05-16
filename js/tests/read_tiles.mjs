@@ -6,19 +6,24 @@
  * with Python output.
  *
  * Usage:
- *   node read_tiles.mjs <tilesDir> [bboxJSON] [level]
+ *   node read_tiles.mjs <tilesDir> [bboxJSON] [level] [--sub-tiles]
  *
  * Arguments:
- *   tilesDir  – path to the directory produced by write_webxtile()
- *   bboxJSON  – optional JSON array, e.g. '[10,5,80,45]' or 'null'
- *   level     – optional integer (0 = root); omit or 'null' for full resolution
+ *   tilesDir    – path to the directory produced by write_webxtile()
+ *   bboxJSON    – optional JSON array, e.g. '[10,5,80,45]' or 'null'
+ *   level       – optional integer (0 = root); omit or 'null' for full resolution
+ *   --sub-tiles – if set, output sub-tile info instead of the normal grid
  *
  * Output (stdout): JSON object with shape
  *   {
  *     "spatial_dims": ["x","y"],
+ *     "split_axes":   ["x","y"],
  *     "coords": { "x": [...], "y": [...] },   // sorted unique Float64 values
  *     "variables": { "varName": [[...],[...]] }, // 2-D grid [ix][iy]
- *     "count": <number of scatter points>
+ *     "count": <number of scatter points>,
+ *     // when --sub-tiles:
+ *     "sub_tile_count": <total sub-tiles>,
+ *     "sub_tile_shapes": [[nx,ny,...], ...]
  *   }
  *
  * The `variables` field contains a 2-D regular grid (sorted by x, then y) so
@@ -103,7 +108,7 @@ function collectTiles(tilesDir, filename, { bbox, level, nSpatial }) {
 
 // ─── Grid extraction (convert scatter → indexed 2-D grid for comparison) ─────
 
-function buildGrid(result) {
+function buildGrid(result, { subTilesMode = false } = {}) {
   const spatialDims = result.spatialDims;
   const { coords, variables, count } = result.toScatter();
 
@@ -113,11 +118,30 @@ function buildGrid(result) {
     sortedCoords[dim] = Array.from(result.getCoord(dim)).map(v => +v.toFixed(6));
   }
 
+  const base = {
+    spatial_dims: spatialDims,
+    split_axes:   result.splitAxes,
+    coords: sortedCoords,
+    count,
+  };
+
+  // Sub-tile summary (for gpu_tile_size tests)
+  if (subTilesMode) {
+    const subTileShapes = [];
+    for (const st of result.subTiles()) {
+      subTileShapes.push(st.shape ?? []);
+    }
+    return {
+      ...base,
+      sub_tile_count:  subTileShapes.length,
+      sub_tile_shapes: subTileShapes,
+    };
+  }
+
   if (spatialDims.length !== 2) {
     // For 3-D datasets return only flattened scatter for simplicity
     return {
-      spatial_dims: spatialDims,
-      coords: sortedCoords,
+      ...base,
       scatter: {
         coords:    Object.fromEntries(
           Object.entries(coords).map(([k,v]) => [k, Array.from(v).map(x => +x.toFixed(4))])
@@ -126,14 +150,10 @@ function buildGrid(result) {
           Object.entries(variables).map(([k,v]) => [k, Array.from(v).map(x => +x.toFixed(4))])
         ),
       },
-      count,
     };
   }
 
   // 2-D: build a sorted index map to assemble a regular grid.
-  // toScatter() converts spatial coords to Float32Array, so we must look up
-  // scatter values using a precision safe for float32 (4 dp) rather than the
-  // full float64 precision returned by getCoord().
   const PREC = 4;
   const fmt  = v => (+v).toFixed(PREC);
 
@@ -162,14 +182,12 @@ function buildGrid(result) {
   }
 
   return {
-    spatial_dims: spatialDims,
-    coords: sortedCoords,
+    ...base,
     variables: Object.fromEntries(
       Object.entries(grids).map(([k, rows]) => [
         k, rows.map(row => Array.from(row).map(v => +v.toFixed(4))),
       ])
     ),
-    count,
   };
 }
 
@@ -177,13 +195,16 @@ function buildGrid(result) {
 
 const args = process.argv.slice(2);
 if (args.length < 1) {
-  process.stderr.write('Usage: node read_tiles.mjs <tilesDir> [bboxJSON] [level]\n');
+  process.stderr.write('Usage: node read_tiles.mjs <tilesDir> [bboxJSON] [level] [--sub-tiles]\n');
   process.exit(1);
 }
 
-const tilesDir = resolve(args[0]);
-const bbox     = args[1] && args[1] !== 'null' ? JSON.parse(args[1]) : null;
-const level    = args[2] && args[2] !== 'null' ? parseInt(args[2], 10) : null;
+const subTilesMode = args.includes('--sub-tiles');
+const posArgs      = args.filter(a => a !== '--sub-tiles');
+
+const tilesDir = resolve(posArgs[0]);
+const bbox     = posArgs[1] && posArgs[1] !== 'null' ? JSON.parse(posArgs[1]) : null;
+const level    = posArgs[2] && posArgs[2] !== 'null' ? parseInt(posArgs[2], 10) : null;
 
 const meta     = readMsgpack(join(tilesDir, 'metadata.msgpack'));
 const rootFile = meta.root_tile ?? 'root.msgpack';
@@ -192,5 +213,5 @@ const nSpatial = meta.spatial_dims.length;
 const tiles  = collectTiles(tilesDir, rootFile, { bbox, level, nSpatial });
 const result = new WebxtileResult(meta, tiles);
 
-const output = buildGrid(result);
+const output = buildGrid(result, { subTilesMode });
 process.stdout.write(JSON.stringify(output, null, 2) + '\n');

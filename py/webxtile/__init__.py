@@ -32,6 +32,7 @@ ds.webxtile.to_webxtile("tiles/")                    # write
 
 from __future__ import annotations
 
+import itertools
 import xarray as xr
 import numpy as np
 import msgpack
@@ -61,6 +62,9 @@ def write_webxtile(
     max_leaf: int | None = None,
     crs: str | None = None,
     z_crs: str | None = None,
+    gpu_tile_size: int | None = None,
+    write_manifest: bool = False,
+    manifest_depth: int = 3,
 ) -> None:
     """Write an xarray Dataset to webxtile octree format.
 
@@ -88,6 +92,16 @@ def write_webxtile(
     z_crs:
         Vertical CRS identifier (e.g. ``"EPSG:4979"``).  When omitted,
         detected from a non-standard ``epsg_z_code`` global attribute.
+    gpu_tile_size:
+        When set, each leaf tile is subdivided into GPU-sized sub-tiles of
+        at most this many grid points per split axis.  ``None`` = no sub-tiles.
+        Recommended: 64 for 3-D, 256 for 2-D datasets.
+    write_manifest:
+        When True, write a manifest pyramid under ``manifest/`` that records
+        which tiles exist using packed bitmaps.  The JS reader uses this to
+        avoid 404 requests on sparse datasets.
+    manifest_depth:
+        How many data-tree levels each manifest tile covers.  Default: 3.
     """
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -102,14 +116,28 @@ def write_webxtile(
     if max_leaf is None:
         max_leaf = 32 if len(spatial_dims) == 3 else 128
 
+    split_axes = _compute_split_axes(ds, spatial_dims)
+
     crs, z_crs, crs_cf_attrs, z_crs_cf_attrs = _resolve_crs_for_write(
         ds, crs, z_crs
     )
     _pack(
         path / _METADATA_FILE,
-        _build_metadata(ds, spatial_dims, crs, z_crs, crs_cf_attrs, z_crs_cf_attrs),
+        _build_metadata(
+            ds, spatial_dims, crs, z_crs, crs_cf_attrs, z_crs_cf_attrs,
+            split_axes=split_axes,
+            gpu_tile_size=gpu_tile_size,
+            manifest_depth=manifest_depth if write_manifest else None,
+        ),
     )
-    _build_tile(ds, path / _ROOT_TILE, spatial_dims, level=0, max_leaf=max_leaf)
+    _build_tile(
+        ds, path / _ROOT_TILE, spatial_dims, split_axes,
+        level=0, max_leaf=max_leaf,
+        gpu_tile_size=gpu_tile_size,
+    )
+
+    if write_manifest:
+        _build_manifest(path, spatial_dims, split_axes, manifest_depth)
 
 
 def read_webxtile(
@@ -396,10 +424,6 @@ def _detect_epsg_from_cf(ds: xr.Dataset, ProjCRS) -> "str | None":
         elif sn == "latitude":
             has_lat = True
     if has_lon and has_lat:
-        # Coordinates named longitude/latitude without an explicit grid_mapping
-        # strongly imply a geographic CRS.  Ask pyproj for the EPSG; fall back
-        # to EPSG:4326 (WGS 84) when the minimal CF params are not enough for
-        # pyproj to resolve a unique code (common with older pyproj builds).
         try:
             proj_crs = ProjCRS.from_cf({"grid_mapping_name": "latitude_longitude"})
             epsg = proj_crs.to_epsg()
@@ -471,6 +495,54 @@ def _resolve_crs_for_write(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Adaptive axis splitting
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_split_axes(ds: xr.Dataset, spatial_dims: list[str]) -> list[str]:
+    """Determine which spatial axes to split at each tree level.
+
+    Splits axis ``a`` iff its physical span strictly exceeds the global minimum
+    span across all axes.  When all spans are equal (e.g. cubic domain), splits
+    all axes (octree fallback).
+    """
+    spans: dict[str, float] = {}
+    for d in spatial_dims:
+        arr = ds[d].values if d in ds.coords else np.arange(ds.sizes[d], dtype=float)
+        spans[d] = float(arr.max() - arr.min()) if len(arr) > 1 else 0.0
+    min_span = min(spans.values())
+    split = [d for d in spatial_dims if spans[d] > min_span]
+    return split if split else list(spatial_dims)
+
+
+def _child_isel(ds: xr.Dataset, spatial_dims: list[str], split_axes: list[str]) -> list[dict]:
+    """Return isel dicts partitioning ds; only axes in split_axes are halved.
+
+    Non-split axes receive a full slice (the child inherits the full extent).
+    Child index bit layout: split_axes[0] = MSB.
+    """
+    mids  = {d: ds.sizes[d] // 2 for d in split_axes}
+    sizes = {d: ds.sizes[d] for d in spatial_dims}
+    n_split = len(split_axes)
+    result = []
+    for ci in range(1 << n_split):
+        sel: dict = {}
+        for ax_i, d in enumerate(split_axes):
+            bit = n_split - 1 - ax_i   # split_axes[0] = MSB
+            m, n = mids[d], sizes[d]
+            sel[d] = slice(m, n) if (ci >> bit) & 1 else slice(0, m)
+        for d in spatial_dims:
+            if d not in split_axes:
+                sel[d] = slice(0, sizes[d])
+        result.append(sel)
+    return result
+
+
+# Keep the old name as an alias for internal callers that still use it.
+def _octree_child_isel(ds: xr.Dataset, spatial_dims: list[str]) -> list[dict]:
+    return _child_isel(ds, spatial_dims, spatial_dims)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Metadata construction
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -481,6 +553,10 @@ def _build_metadata(
     z_crs: "str | None",
     crs_cf_attrs: dict,
     z_crs_cf_attrs: dict,
+    *,
+    split_axes: list[str] | None = None,
+    gpu_tile_size: int | None = None,
+    manifest_depth: int | None = None,
 ) -> dict:
     """Assemble the metadata dict stored in metadata.msgpack."""
     coord_meta: dict = {}
@@ -515,15 +591,17 @@ def _build_metadata(
     spatial_coords = _spatial_coord_arrays(ds, spatial_dims)
     global_bounds = _bounds_from_spatial_coords(spatial_coords, spatial_dims)
 
-    return {
+    if split_axes is None:
+        split_axes = list(spatial_dims)
+
+    meta = {
         "version":        _FORMAT_VERSION,
         "root_tile":      _ROOT_TILE,
         "bounds":         global_bounds,
         "spatial_dims":   list(spatial_dims),
+        "split_axes":     list(split_axes),
         "crs":            crs,
         "z_crs":          z_crs,
-        # Full CF attribute dicts derived from the EPSG codes; used on read to
-        # restore a ``spatial_ref`` grid-mapping coordinate for CF compliance.
         "crs_cf_attrs":   {str(k): _to_serialisable(v) for k, v in crs_cf_attrs.items()},
         "z_crs_cf_attrs": {str(k): _to_serialisable(v) for k, v in z_crs_cf_attrs.items()},
         "dim_sizes":      {str(k): int(v) for k, v in ds.sizes.items()},
@@ -531,6 +609,13 @@ def _build_metadata(
         "var_meta":       var_meta,
         "global_attrs":   global_attrs,
     }
+
+    if gpu_tile_size is not None:
+        meta["gpu_tile_size"] = int(gpu_tile_size)
+    if manifest_depth is not None:
+        meta["manifest_depth"] = int(manifest_depth)
+
+    return meta
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -604,59 +689,66 @@ def _downsample_spatial_coords(
     return out
 
 
-def _octree_child_isel(ds: xr.Dataset, spatial_dims: list[str]) -> list[dict]:
-    """Return the list of isel dicts that partition ds along spatial dims."""
-    mids  = {d: ds.sizes[d] // 2 for d in spatial_dims}
-    sizes = {d: ds.sizes[d] for d in spatial_dims}
+def _partition_sub_tiles(
+    ds: xr.Dataset,
+    spatial_dims: list[str],
+    split_axes: list[str],
+    gpu_tile_size: int,
+) -> list[dict]:
+    """Partition a leaf tile dataset into GPU-sized sub-tiles.
 
-    if len(spatial_dims) == 3:
-        x, y, z = spatial_dims
-        xm, ym, zm = mids[x], mids[y], mids[z]
-        nx, ny, nz = sizes[x], sizes[y], sizes[z]
-        return [
-            {x: slice(0,  xm), y: slice(0,  ym), z: slice(0,  zm)},
-            {x: slice(0,  xm), y: slice(0,  ym), z: slice(zm, nz)},
-            {x: slice(0,  xm), y: slice(ym, ny), z: slice(0,  zm)},
-            {x: slice(0,  xm), y: slice(ym, ny), z: slice(zm, nz)},
-            {x: slice(xm, nx), y: slice(0,  ym), z: slice(0,  zm)},
-            {x: slice(xm, nx), y: slice(0,  ym), z: slice(zm, nz)},
-            {x: slice(xm, nx), y: slice(ym, ny), z: slice(0,  zm)},
-            {x: slice(xm, nx), y: slice(ym, ny), z: slice(zm, nz)},
-        ]
-    else:  # 2-D: quadtree
-        x, y = spatial_dims
-        xm, ym = mids[x], mids[y]
-        nx, ny = sizes[x], sizes[y]
-        return [
-            {x: slice(0,  xm), y: slice(0,  ym)},
-            {x: slice(0,  xm), y: slice(ym, ny)},
-            {x: slice(xm, nx), y: slice(0,  ym)},
-            {x: slice(xm, nx), y: slice(ym, ny)},
-        ]
+    Sub-tiles are ordered in row-major BFS order along split_axes so that
+    GPU upload order is spatially coherent.  If the tile fits within
+    gpu_tile_size along every split axis, a single sub-tile is returned.
+    """
+    def chunk_slices(n: int) -> list[slice]:
+        return [slice(i, min(i + gpu_tile_size, n)) for i in range(0, n, gpu_tile_size)]
+
+    slices_per_axis = {d: chunk_slices(ds.sizes[d]) for d in split_axes}
+
+    sub_tiles: list[dict] = []
+    for combo in itertools.product(*[slices_per_axis[d] for d in split_axes]):
+        isel = {split_axes[i]: combo[i] for i in range(len(split_axes))}
+        sub_ds = ds.isel(isel)
+        sc = _spatial_coord_arrays(sub_ds, spatial_dims)
+        sub_tiles.append({
+            "bounds":         _bounds_from_spatial_coords(sc, spatial_dims),
+            "shape":          [sub_ds.sizes[d] for d in spatial_dims],
+            "spatial_coords": sc,
+            "variables":      _variable_arrays(sub_ds, spatial_dims),
+        })
+    return sub_tiles
 
 
 def _build_tile(
     ds: xr.Dataset,
     tile_path: Path,
     spatial_dims: list[str],
+    split_axes: list[str],
     level: int,
     max_leaf: int,
+    gpu_tile_size: int | None = None,
 ) -> None:
     """Recursively write one tile and its subtree."""
-    if max(ds.sizes[d] for d in spatial_dims) <= max_leaf:
-        _write_leaf_tile(ds, tile_path, spatial_dims, level)
+    if max(ds.sizes[d] for d in split_axes) <= max_leaf:
+        _write_leaf_tile(ds, tile_path, spatial_dims, split_axes, level,
+                         gpu_tile_size=gpu_tile_size)
     else:
-        _write_internal_tile(ds, tile_path, spatial_dims, level, max_leaf)
+        _write_internal_tile(ds, tile_path, spatial_dims, split_axes, level,
+                             max_leaf=max_leaf, gpu_tile_size=gpu_tile_size)
 
 
 def _write_leaf_tile(
     ds: xr.Dataset,
     tile_path: Path,
     spatial_dims: list[str],
+    split_axes: list[str],
     level: int,
+    *,
+    gpu_tile_size: int | None = None,
 ) -> None:
     sc = _spatial_coord_arrays(ds, spatial_dims)
-    tile = {
+    tile: dict = {
         "level":          level,
         "is_leaf":        True,
         "bounds":         _bounds_from_spatial_coords(sc, spatial_dims),
@@ -664,6 +756,8 @@ def _write_leaf_tile(
         "spatial_coords": sc,
         "variables":      _variable_arrays(ds, spatial_dims),
     }
+    if gpu_tile_size is not None:
+        tile["sub_tiles"] = _partition_sub_tiles(ds, spatial_dims, split_axes, gpu_tile_size)
     tile_path.parent.mkdir(parents=True, exist_ok=True)
     _pack(tile_path, tile)
 
@@ -672,24 +766,27 @@ def _write_internal_tile(
     ds: xr.Dataset,
     tile_path: Path,
     spatial_dims: list[str],
+    split_axes: list[str],
     level: int,
     max_leaf: int,
+    gpu_tile_size: int | None = None,
 ) -> None:
     # The internal node stores a 2× downsampled overview of this subtree's
     # data so that any LOD level can be served without loading leaf tiles.
     sc_down = _downsample_spatial_coords(ds, spatial_dims)
     vars_down = _variable_arrays(ds, spatial_dims, zoom_factor=0.5)
 
-    # Build children
+    # Build children using adaptive split axes.
     children: list[str] = []
-    for i, isel_dict in enumerate(_octree_child_isel(ds, spatial_dims)):
+    for i, isel_dict in enumerate(_child_isel(ds, spatial_dims, split_axes)):
         child_ds = ds.isel(isel_dict)
         if any(child_ds.sizes[d] == 0 for d in spatial_dims):
             continue
         child_name = f"{tile_path.stem}_{i}.msgpack"
         child_path = tile_path.parent / child_name
         children.append(child_name)
-        _build_tile(child_ds, child_path, spatial_dims, level + 1, max_leaf)
+        _build_tile(child_ds, child_path, spatial_dims, split_axes,
+                    level + 1, max_leaf, gpu_tile_size=gpu_tile_size)
 
     sc = _spatial_coord_arrays(ds, spatial_dims)
     tile = {
@@ -703,6 +800,76 @@ def _write_internal_tile(
     }
     tile_path.parent.mkdir(parents=True, exist_ok=True)
     _pack(tile_path, tile)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Manifest construction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _bfs_tile_names(root_stem: str, branch: int, max_depth: int) -> list[str]:
+    """Return all tile names reachable from root_stem within max_depth levels, BFS order.
+
+    The root itself is at depth 0 (index 0 in the returned list).
+    """
+    queue = [root_stem]
+    result = [root_stem + ".msgpack"]
+    for _ in range(max_depth):
+        next_queue: list[str] = []
+        for stem in queue:
+            for ci in range(branch):
+                child_stem = f"{stem}_{ci}"
+                result.append(child_stem + ".msgpack")
+                next_queue.append(child_stem)
+        queue = next_queue
+    return result
+
+
+def _write_manifest_node(
+    data_root: Path,
+    manifest_dir: Path,
+    tile_path: Path,
+    split_axes: list[str],
+    depth: int,
+) -> None:
+    """Write one manifest tile covering *depth* levels below tile_path."""
+    branch = 1 << len(split_axes)
+    stem = tile_path.stem  # e.g. "root_0_1"
+    all_slots = _bfs_tile_names(stem, branch, depth)
+
+    existing = {name for name in all_slots if (data_root / name).exists()}
+
+    bits = bytearray((len(all_slots) + 7) // 8)
+    for i, name in enumerate(all_slots):
+        if name in existing:
+            bits[i >> 3] |= 1 << (i & 7)
+
+    tile = _unpack(tile_path)
+    _pack(manifest_dir / f"m_{tile_path.name}", {
+        "bounds": tile["bounds"],
+        "root":   tile_path.name,
+        "depth":  depth,
+        "tiles":  bytes(bits),
+    })
+
+    # Recurse so every internal node in the data tree gets a manifest file.
+    for child_name in tile.get("children", []):
+        child_path = data_root / child_name
+        if child_path.exists():
+            _write_manifest_node(data_root, manifest_dir, child_path, split_axes, depth)
+
+
+def _build_manifest(
+    path: Path,
+    spatial_dims: list[str],
+    split_axes: list[str],
+    manifest_depth: int,
+) -> None:
+    """Write manifest pyramid under path/manifest/."""
+    manifest_dir = path / "manifest"
+    manifest_dir.mkdir(exist_ok=True)
+    root_tile_path = path / _ROOT_TILE
+    if root_tile_path.exists():
+        _write_manifest_node(path, manifest_dir, root_tile_path, split_axes, manifest_depth)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

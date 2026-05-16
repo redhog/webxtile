@@ -1,5 +1,21 @@
 # WebXTile Format Analysis & Scalability Findings
 
+## Implementation Status
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Adaptive axis splitting | ✅ Implemented | `_compute_split_axes`; `split_axes` in metadata; Python writer + JS reader use it |
+| GPU sub-tiles (S3 inner level) | ✅ Implemented | `gpu_tile_size` param; leaf tiles carry `sub_tiles` field; `WebxtileResult.subTiles()` in JS |
+| Manifest pyramid (S8) | ✅ Implemented | `write_manifest` param; `manifest/m_*.msgpack`; JS skips 404s using bitmaps |
+| S3 outer-level bundling | ❌ Not yet | `streamLeaves()` still O(depth) round-trips; bundled network files not written |
+| S0 (`max_leaf` tuning) | ❌ Not yet | Still uses defaults (32 for 3D, 128 for 2D) |
+| S1 (directory sharding) | ❌ Not yet | |
+| S2 (single-file archive) | ❌ Not yet | |
+| S4 (streaming `toScatter()`) | ❌ Not yet | |
+| S5 (IndexedDB LRU) | ❌ Not yet | |
+
+---
+
 ## Format Specification
 
 ### Container Layout
@@ -19,8 +35,8 @@ dataset/
 
 Splitting happens at the **index midpoint** of each spatial axis (not the coordinate midpoint). Two independent termination conditions apply:
 
-- **Per-axis**: axis `a` is split only if its physical coordinate span exceeds the **globally minimum physical span across all axes at the root** (a fixed threshold, computed once at write time). Axes at or below this threshold are never split.
-- **Global leaf**: node becomes a leaf when `max(all axis sizes) ≤ max_leaf`.
+- **Per-axis**: axis `a` is split only if its physical coordinate span exceeds the **globally minimum physical span across all axes at the root** (a fixed threshold, computed once at write time). Axes at or below this threshold are never split. The set of split axes is stored in `metadata.msgpack` as `split_axes` and is fixed for the whole tree. ✅
+- **Global leaf**: node becomes a leaf when `max(split_axis sizes) ≤ max_leaf`. Only split axes are checked — non-split axes can be arbitrarily large (a geophysics leaf tile covers the full z column). ✅
 
 The branching factor emerges from how many axes exceed the root's minimum physical span:
 
@@ -52,10 +68,11 @@ Empty children (zero points on any axis) are omitted.
 | `level`         | int                     | Tree depth (0 = root)                            |
 | `is_leaf`       | bool                    | Whether this is a leaf node                      |
 | `bounds`        | float[6]                | AABB: `[x_min, y_min, z_min, x_max, y_max, z_max]` |
-| `shape`         | int[]                   | Grid dimensions in this tile                     |
+| `shape`         | int[]                   | Grid dimensions in this tile (all spatial dims)  |
 | `spatial_coords`| map[str → float64[]]    | 1D coordinate arrays per spatial axis            |
 | `variables`     | map[str → float32[]]    | Data variables (flat, row-major)                 |
 | `children`      | str[]                   | Relative filenames of child tiles (internal only) |
+| `sub_tiles`     | object[]                | ✅ GPU-sized rendering chunks (leaf tiles only, written when `gpu_tile_size` is set). Each entry has the same shape as a tile: `{bounds, shape, spatial_coords, variables}`. Ordered in row-major BFS sequence along `split_axes` for spatially coherent GPU upload. |
 
 ### Level-of-Detail (LOD)
 
@@ -64,6 +81,11 @@ Internal nodes store **bilinearly/trilinearly downsampled** data at 0.5× resolu
 ### Metadata File
 
 `metadata.msgpack` contains: format version, spatial dimension names, CRS (EPSG), per-coordinate metadata (with embedded values for non-spatial dims like time), per-variable metadata (dims, dtype, attrs), and global CF attributes.
+
+New fields added by implemented features:
+- `split_axes` — list of axis names that are split at each tree level (subset of `spatial_dims`); absent in old datasets, fallback to `spatial_dims`. ✅
+- `gpu_tile_size` — integer; present only when sub-tiles were written. ✅
+- `manifest_depth` — integer; present only when the manifest pyramid was written. ✅
 
 ---
 
@@ -216,12 +238,12 @@ The response body is raw msgpack bytes — identical to what the current decoder
 }
 ```
 
-- **Outer level** (network granularity): one HTTP fetch per bundle, ~200 MB. One round-trip for `streamLeaves()` instead of O(depth).
-- **Inner level** (GPU granularity): pre-partitioned, pre-sorted rendering sub-tiles packed as msgpack array fields. No byte-offset index needed — the client decodes the full msgpack into RAM (~200 MB, fine), then streams sub-tiles to the GPU one at a time.
+- **Outer level** (network granularity): one HTTP fetch per bundle, ~200 MB. One round-trip for `streamLeaves()` instead of O(depth). ❌ Not yet implemented.
+- **Inner level** (GPU granularity): pre-partitioned, pre-sorted rendering sub-tiles packed as msgpack array fields. No byte-offset index needed — the client decodes the full msgpack into RAM (~200 MB, fine), then streams sub-tiles to the GPU one at a time. ✅ **Implemented**: leaf tiles carry an optional `sub_tiles` array when written with `gpu_tile_size`; `WebxtileResult.subTiles()` in JS iterates them (falls back to the tile itself when absent).
 
 The spatial partitioning and sorting of sub-tiles is done **once at write time**, not per client fetch. This is efficient because write-once / read-many: the client pays zero CPU for partitioning, just iterates the array and uploads.
 
-**Interaction with S0**: increasing `max_leaf` to reduce tile count is only safe because this bundle structure handles rendering granularity independently. Without S3, large `max_leaf` values would produce tiles that are too large to upload to the GPU in one buffer.
+**Interaction with S0**: increasing `max_leaf` to reduce tile count is only safe because this bundle structure handles rendering granularity independently. Without S3's inner level, large `max_leaf` values would produce tiles that are too large to upload to the GPU in one buffer. The inner level (✅ implemented) already decouples network and GPU granularity; the outer level (❌ not yet) is needed only to fix `streamLeaves()` round-trips.
 
 ---
 
@@ -264,7 +286,7 @@ The spatial partitioning and sorting of sub-tiles is done **once at write time**
 
 ---
 
-### S8 — Existence Manifest Pyramid for Holey Grids
+### S8 — Existence Manifest Pyramid for Holey Grids ✅ Implemented
 
 **Problem**: datasets with non-uniform spatial coverage ("holey" grids) degrade `loadBBox()` in two ways:
 
@@ -312,12 +334,69 @@ Depth 3 is a reasonable default: 85 manifest tiles total, ~100 KB each — fetch
 
 1. Determine which manifest tiles cover the query bbox (typically 1–4 tiles at the right manifest level). Their names follow the same `m_root_i_j.msgpack` naming scheme, computable directly from bounds — no sequential traversal.
 2. Fetch those manifest tiles in parallel (one round-trip).
-3. Take the union of their `tiles` arrays, filter to tiles intersecting the query bbox and target zoom level.
-4. Fetch exactly those tiles in parallel — no 404s, no fallback hops.
+3. For each candidate tile name (computable from the naming scheme + bbox), look up its existence bit in the manifest bitmap.
+4. Fetch exactly the existing tiles in parallel — no 404s, no fallback hops.
 
 Total round-trips for `loadBBox()`: **2** (manifest batch + data batch) instead of 1 + O(fallback hops).
 
 **Write-time cost**: one additional pass over the tile tree at write time, building manifest objects bottom-up. Negligible compared to data tile generation.
+
+#### Bitmap encoding
+
+Rather than listing tile names as strings (~25 bytes each), existence is encoded as a packed bitmap — 1 bit per tile slot in BFS order within the manifest tile's subtree. For a manifest tile at depth 3 covering a quadtree region, the maximum number of tile slots is (4⁴ − 1) / 3 = 85, giving an 11-byte bitmap.
+
+| Encoding | 1 000 tiles | 85 tiles |
+|----------|-------------|----------|
+| String list | ~25 KB | ~2 KB |
+| msgpack bool array | ~1 KB | ~85 B |
+| Packed bitmap (`bin`) | ~125 B | **11 B** |
+
+**Tile ordering**: BFS within the manifest subtree, derived directly from WebXTile's path-sequence naming. No Morton curve required — the client already computes candidate tile names from the naming scheme, and looks up each candidate's BFS index in O(depth):
+
+```
+Position 0:  manifest root
+Position 1:  child 0
+Position 2:  child 1
+Position 3:  child 2
+Position 4:  child 3
+Position 5:  child 0 → child 0
+Position 6:  child 0 → child 1
+...
+```
+
+**Msgpack encoding**: pack bits into a plain `bytes` object on the Python side; msgpack encodes it as `bin` type. The JS client receives a `Uint8Array`:
+
+```python
+# writer (Python) — uses plain bytearray, not numpy, so msgpack encodes as bin type
+def encode_bitmap(existing: set[str], all_tiles: list[str]) -> bytes:
+    bits = bytearray((len(all_tiles) + 7) // 8)
+    for i, name in enumerate(all_tiles):
+        if name in existing:
+            bits[i >> 3] |= 1 << (i & 7)
+    return bytes(bits)  # msgpack bin → JS Uint8Array
+```
+
+```javascript
+// client (JS)
+function tileExists(bitmap, tileIndex) {
+    return (bitmap[tileIndex >> 3] & (1 << (tileIndex & 7))) !== 0;
+}
+```
+
+Do **not** use msgpack-numpy's array format here — it adds a numpy header the JS decoder does not understand natively. Plain `bytes` → msgpack `bin` → JS `Uint8Array` is universally decodable.
+
+**Manifest tile structure**:
+
+```python
+{
+    "bounds": [x_min, y_min, z_min, x_max, y_max, z_max],
+    "root":   "root_0_1.msgpack",  # data tile at this manifest node's root
+    "depth":  3,                    # levels below root covered by this manifest
+    "tiles":  b'\x...',             # packed bitmap, BFS order
+}
+```
+
+Morton ordering (used by 3D Tiles availability bitstreams) would additionally allow spatial range scans on the bitmap itself, but the WebXTile client workflow does not require this: candidates are computed from the naming scheme, then each is checked in O(1) regardless of ordering.
 
 **Interaction with S2**: S2's `index.msgpack` already maps every tile name to a byte offset, so it implicitly lists all existing tiles. For small datasets, the client could use S2's flat index as a substitute — fetch the full index once, parse it, then filter by bbox. However, S2's index is not spatially indexed; for large sparse datasets the client must download and parse the entire index (potentially many MB) before filtering. The manifest pyramid is the spatially-indexed counterpart: pay only for the regions you query.
 
@@ -327,15 +406,116 @@ Total round-trips for `loadBBox()`: **2** (manifest batch + data batch) instead 
 
 ---
 
+---
+
+## Comparison with 3D Tiles (CesiumGS)
+
+[3D Tiles](https://github.com/CesiumGS/3d-tiles/tree/main/specification) is the OGC standard for streaming large-scale geospatial 3D content to browsers. It addresses a largely overlapping problem space but from a rendering-first perspective rather than a scientific-data-first perspective.
+
+### Tree Structure & Splitting
+
+| Aspect | WebXTile | 3D Tiles |
+|--------|----------|----------|
+| Scheme | Physics-driven adaptive: splits axis `a` only if its physical span exceeds the global minimum physical span at the root | Flexible: quadtree, octree, k-d tree, or irregular — author's choice |
+| Geophysics result | Pure quadtree for flat datasets (z suppressed by physical span rule), regardless of vertical resolution | No built-in physics rule; author must manually configure quadtree + suppress z |
+| Implicit naming | Path encodes tree coordinates: `root_0_1_3` | 3D Tiles 1.1 Implicit Tiling formalises this with Morton-ordered availability bitstreams and subtree bundles |
+| Sparse datasets | Speculative fetch by name + 404 fallback; cascades into extra round-trips | Availability bitstreams in subtree files — client knows *a priori* which tiles exist, zero 404s |
+
+WebXTile's S8 manifest pyramid (with bitmap encoding) is a direct analogue of 3D Tiles availability bitstreams. The key difference is encoding: 3D Tiles uses Morton-ordered bits enabling spatial range scans on the bitstream itself; WebXTile uses BFS-ordered bits which are sufficient because candidates are already computed from the naming scheme before the bitmap is consulted.
+
+### Level-of-Detail
+
+| Aspect | WebXTile | 3D Tiles |
+|--------|----------|----------|
+| LOD metric | None — client picks a depth level explicitly via `loadBBox(level)` | `geometricError` (metres) → screen-space error (pixels) → auto-refine when SSE ≥ threshold |
+| Downsampling | Bilinear/trilinear `scipy.ndimage.zoom(order=1)` stored at each internal node | Internal nodes store simplified geometry (decimated mesh, thinned point cloud, etc.) |
+| Refinement mode | Implicit REPLACE — deeper tiles replace shallower ones | Explicit `REPLACE` or `ADD` per tile |
+| Visual continuity | None — client must manage transitions manually | "Kicking" (parent stays visible while children load) + ancestor-meets-SSE guarantee |
+
+The absence of a LOD metric is the most significant functional gap. 3D Tiles clients automatically select the right resolution for the current camera distance; WebXTile clients must choose a depth level manually, risking over- or under-fetching on zoom.
+
+### Tile Content Format
+
+| Aspect | WebXTile | 3D Tiles |
+|--------|----------|----------|
+| Format | msgpack: 1D coordinate arrays + float32 variable arrays | glTF 2.0; legacy B3DM / PNTS / I3DM |
+| Primary use | Scientific grid data (regular coords + named CF variables) | Renderable geometry (meshes, point clouds, instances) |
+| GPU pipeline | Fully programmable: 1D arrays upload directly to GPU, shading and attribute layout defined in GLSL | Fixed glTF material pipeline; non-standard rendering requires extensions |
+| CRS in shader | Coordinate transforms applied in GLSL at zero overhead (current Gladly approach) | Per-tile `transform` matrices applied in JS before upload |
+| Non-spatial dims | Supported (time, depth, ensemble); `toScatter()` truncates them but direct tile access is full-ND | Not natively supported; requires custom extensions |
+
+glTF is "GPU-native" only for glTF-shaped pipelines. For scientific visualization (false-colour conductivity, cross-sections, isosurfaces) a blank shader canvas is strictly more powerful. `toScatter()` is a JS-side analysis convenience; the rendering path streams tiles directly to the Gladly layer output without any JS-side expansion.
+
+### Sparse Grid Discovery
+
+| Aspect | WebXTile | 3D Tiles |
+|--------|----------|----------|
+| Existence encoding | S8 manifest tiles with packed bitmap (BFS order, msgpack `bin`) | Availability bitstreams (Morton order, packed bits) in subtree files |
+| Bit density | 1 bit/tile slot | 1 bit/tile slot |
+| Ordering | BFS within manifest subtree | Morton Z-order across full implicit grid |
+| Spatial range scan on bitmap | Not needed (candidates pre-computed from naming scheme) | Efficient: a bbox maps to contiguous Morton ranges |
+| Subtree traversal | S8 bitmap only encodes existence; children still read from data tiles in `streamLeaves()` | Subtree files encode tile + content + child-subtree availability; full traversal never touches data tiles |
+| Client complexity | Bit manipulation on `Uint8Array`; BFS index computed from path sequence | Morton interleave of (level, x, y); bit lookup in subtree buffer |
+
+For WebXTile's use case, BFS ordering is sufficient and requires no Morton curve implementation. Morton ordering would only add value if the client needed to find all existing tiles in an arbitrary bbox by scanning the bitmap as a range — but WebXTile candidates are already enumerated from the naming scheme, making the bitmap a pure existence filter.
+
+### HTTP & Streaming
+
+| Aspect | WebXTile | 3D Tiles |
+|--------|----------|----------|
+| Request granularity | One file per tile (no sub-tile range access) | One file per tile (explicit); subtree bundle files in Implicit Tiling |
+| Concurrency control | 16-fetch semaphore in JS | Client-managed; no spec limit |
+| `streamLeaves()` round-trips | O(depth) sequential hops following `children` fields | O(1) with Implicit Tiling subtrees (availability known before fetching data tiles) |
+| Subtree bundling | Proposed in S3 | Native in Implicit Tiling subtree files |
+
+### Metadata & CRS
+
+| Aspect | WebXTile | 3D Tiles |
+|--------|----------|----------|
+| Dataset metadata | `metadata.msgpack`: CRS (EPSG), dim names, per-variable CF attrs | `tileset.json`: geometric error, asset metadata, optional schema |
+| Per-tile metadata | Embedded in tile file | Inline tile object or external JSON; four levels (tileset / tile / content / feature) |
+| CRS | EPSG code in metadata; coordinates in dataset CRS | WGS84 ECEF default; per-tile `transform` matrices for local CRS composition |
+| Per-feature metadata | Grid cells addressed by index; no named per-feature properties | Full per-vertex / per-instance typed metadata via glTF extensions |
+
+### Summary
+
+**Where WebXTile is stronger:**
+
+- **Physics-aware axis suppression**: the geophysics-correct quadtree decision (physical span, not grid count) is automatic and requires no per-dataset configuration.
+- **Scientific data model**: named variables, 1D coordinate arrays, CF metadata, non-spatial dimensions (time, depth, ensemble). 3D Tiles has none of this natively.
+- **Compact grid encoding**: 1D coordinate arrays + flat variable arrays are far smaller than full vertex arrays for regular grids.
+- **Programmable GPU pipeline**: GLSL shaders control attribute layout, colormapping, and geometry generation — more powerful than glTF's fixed material model for scientific visualization.
+
+**Where 3D Tiles is stronger:**
+
+- **Geometric error / SSE**: automatic, camera-distance-driven LOD selection. WebXTile requires the client to choose a depth level manually.
+- **Visual continuity**: kicking, ancestor-SSE guarantees. WebXTile has no equivalent.
+- **Zero-404 traversal with Implicit Tiling**: subtree files encode full availability; `streamLeaves()`-style traversal never reads data tiles to find children.
+
+**Direct mapping of ANALYSIS.md proposals to 3D Tiles features:**
+
+| ANALYSIS.md | 3D Tiles equivalent | Notes |
+|-------------|--------------------|----|
+| S3 (subtree bundling) | Implicit Tiling subtree files | 3DT bundles availability + data; S3 bundles data only |
+| S8 (manifest pyramid + bitmap) | Availability bitstreams | Same bit density; BFS vs Morton ordering; S8 is simpler to implement on top of existing naming scheme |
+| S5 (IndexedDB LRU) | Cesium memory budget + LRU | 3DT does this in RAM; WebXTile does it in persistent IndexedDB |
+| S0 (max_leaf tuning) | `geometricError` tuning | 3DT makes LOD continuous and view-dependent; WebXTile's is discrete depth levels |
+| S4 (streaming `toScatter()`) | Not needed in 3DT | Rendering path in WebXTile already bypasses `toScatter()` by streaming directly to Gladly |
+
+The core architectural divergence is intentional: 3D Tiles is a **rendering-first** format (geometry → fixed GPU pipeline), WebXTile is a **science-first** format (fields → programmable GPU pipeline + analysis). They are complementary, not competing, for a system that needs both scientific analysis and high-performance rendering.
+
+---
+
 ### Priority Recommendation
 
 For the Nagelfluh use case (geophysics grids, browser-based visualization):
 
-1. **S3** (subtree bundling with embedded GPU sub-tiles) — solves both `streamLeaves()` latency (O(depth) → O(1) round-trips) and the rendering/network tile size conflict. Pre-partitioned sub-tiles in the bundle eliminate client-side partitioning work. Required before S0 is safe to use at large `max_leaf` values.
-2. **S0** (increase `max_leaf`) — tune at write time once S3 is in place. Use `max_leaf=256` for 3D, `max_leaf=4096` for 2D to target ~16M points per network bundle.
-3. **Adaptive axis splitting** (writer change) — split axis `a` only if its physical span exceeds the globally minimum physical span at the root (fixed threshold, computed once). A per-node comparison (current min) produces octs at the top levels and quads only deep in the tree — the wrong order for geophysics. A grid-count comparison breaks entirely at fine vertical resolution (1 cm bins give z 50,000 points, making it the maximum, not minimum). The fixed physical threshold gives a pure quadtree for flat datasets regardless of discretization. No format or reader changes required.
-4. **S5** (IndexedDB LRU) — low effort, prevents silent quota exhaustion.
-5. **S4** (streaming `toScatter()`) — important once datasets grow beyond single-session memory.
-6. **S8** (existence manifest pyramid) — implement when datasets have non-uniform spatial coverage (survey lines, coastal data, gapped composites). Eliminates 404 fallback hops for holey grids at the cost of one extra parallel round-trip per `loadBBox()` call.
-7. **S2** (single-file archive) — operational win for large deployments; no browser benefit.
-8. **S1** (directory sharding) — quick defensive fix if S2 is deferred.
+1. ✅ **Adaptive axis splitting** — implemented. Pure quadtree for geophysics datasets; full z column in every leaf tile.
+2. ✅ **S3 inner level** (GPU sub-tiles in leaf tiles) — implemented. `gpu_tile_size` parameter; `WebxtileResult.subTiles()` in JS. Decouples network granularity from GPU upload granularity.
+3. ✅ **S8** (existence manifest pyramid) — implemented. `write_manifest` parameter; JS uses bitmaps to skip 404 fetches for holey grids.
+4. **S0** (increase `max_leaf`) — tune at write time. Now safe to use large values because sub-tiles (S3 inner level) handle GPU granularity. Use `max_leaf=256` for 3D, `max_leaf=4096` for 2D to target ~16M points per network tile.
+5. **S3 outer level** (network bundling for `streamLeaves()`) — still needed to reduce `streamLeaves()` from O(depth) round-trips to O(1). Required if background streaming is performance-critical.
+6. **S5** (IndexedDB LRU) — low effort, prevents silent quota exhaustion.
+7. **S4** (streaming `toScatter()`) — important once datasets grow beyond single-session memory.
+8. **S2** (single-file archive) — operational win for large deployments; no browser benefit.
+9. **S1** (directory sharding) — quick defensive fix if S2 is deferred.

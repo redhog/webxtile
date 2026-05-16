@@ -1264,6 +1264,56 @@ var webxtile = (() => {
       _concurrentFetches--;
     }
   }
+  function _parentFilename(filename) {
+    const stem = filename.replace(/\.msgpack$/, "");
+    const us = stem.lastIndexOf("_");
+    if (us < 0 || !/^\d+$/.test(stem.slice(us + 1))) return null;
+    return stem.slice(0, us) + ".msgpack";
+  }
+  function _candidatesAtLevel(rootFilename, rootBounds, bbox, targetLevel, spatialDims, splitAxes) {
+    const nSplit = splitAxes.length;
+    const branchFactor = 1 << nSplit;
+    const nSpatial = spatialDims.length;
+    const rootStem = rootFilename.replace(/\.msgpack$/, "");
+    const out = [];
+    function recurse(stem, bounds, depth) {
+      if (!_intersects(bounds, bbox, nSpatial)) return;
+      if (depth === targetLevel) {
+        out.push(stem + ".msgpack");
+        return;
+      }
+      for (let ci = 0; ci < branchFactor; ci++) {
+        const cb = bounds.slice();
+        for (let si = 0; si < nSplit; si++) {
+          const d = spatialDims.indexOf(splitAxes[si]);
+          const bit = nSplit - 1 - si;
+          const mid = (bounds[d] + bounds[d + 3]) / 2;
+          if (ci >> bit & 1) cb[d] = mid;
+          else cb[d + 3] = mid;
+        }
+        recurse(stem + "_" + ci, cb, depth + 1);
+      }
+    }
+    recurse(rootStem, rootBounds, 0);
+    return out;
+  }
+  function _tileExists(bitmap, index) {
+    return (bitmap[index >> 3] & 1 << (index & 7)) !== 0;
+  }
+  function _bfsTileIndexIter(childParts, branch) {
+    const L = childParts.length;
+    let levelStart = 0;
+    let b = 1;
+    for (let l = 0; l < L; l++) {
+      levelStart += b;
+      b *= branch;
+    }
+    let pos = 0;
+    for (const part of childParts) {
+      pos = pos * branch + parseInt(part, 10);
+    }
+    return levelStart + pos;
+  }
   var _textDecoder = new TextDecoder();
   function _msgpackKeyConverter(key) {
     if (key instanceof Uint8Array) return _textDecoder.decode(key);
@@ -1304,6 +1354,10 @@ var webxtile = (() => {
      */
     get spatialDims() {
       return this._meta.spatial_dims;
+    }
+    /** Axes that are split at each tree level (subset of spatialDims). */
+    get splitAxes() {
+      return this._meta.split_axes ?? this._meta.spatial_dims;
     }
     /** Horizontal CRS identifier string or null. */
     get crs() {
@@ -1354,6 +1408,28 @@ var webxtile = (() => {
       return new Float64Array(vals);
     }
     /**
+     * Iterate GPU-sized sub-tiles from all loaded tiles.
+     *
+     * Falls back to the tile itself when no sub_tiles field is present (e.g.
+     * internal tiles or datasets written without gpu_tile_size).
+     *
+     * @yields {{ bounds, shape, spatial_coords, variables }}
+     */
+    *subTiles() {
+      for (const tile of this._tiles) {
+        if (tile.sub_tiles?.length > 0) {
+          yield* tile.sub_tiles;
+        } else {
+          yield {
+            bounds: tile.bounds,
+            shape: tile.shape,
+            spatial_coords: tile.spatial_coords,
+            variables: tile.variables
+          };
+        }
+      }
+    }
+    /**
      * Flatten all loaded tiles into parallel scatter arrays.
      *
      * For each tile the 1-D spatial coordinate arrays (`spatial_coords`) are
@@ -1376,25 +1452,36 @@ var webxtile = (() => {
     toScatter() {
       const spatialDims = this._meta.spatial_dims;
       const nD = spatialDims.length;
-      const cBufs = {};
-      for (const d of spatialDims) cBufs[d] = [];
-      const vBufs = {};
+      const tileInfo = [];
+      let totalCount = 0;
+      const varNames = /* @__PURE__ */ new Set();
       for (const tile of this._tiles) {
         const sc = tile.spatial_coords ?? {};
         const dimArrs = spatialDims.map((d) => sc[d] ?? new Float64Array(0));
         const nPerDim = dimArrs.map((a) => a.length);
         const nTotal = nPerDim.reduce((a, b) => a * b, 1);
+        tileInfo.push({ dimArrs, nPerDim, nTotal });
+        totalCount += nTotal;
+        for (const name of Object.keys(tile.variables ?? {})) varNames.add(name);
+      }
+      const coords = Object.fromEntries(spatialDims.map((d) => [d, new Float32Array(totalCount)]));
+      const variables = Object.fromEntries([...varNames].map((n) => [n, new Float32Array(totalCount).fill(NaN)]));
+      let offset = 0;
+      for (let ti = 0; ti < this._tiles.length; ti++) {
+        const tile = this._tiles[ti];
+        const { dimArrs, nPerDim, nTotal } = tileInfo[ti];
         if (nTotal === 0) continue;
         const spStrides = new Array(nD);
         spStrides[nD - 1] = 1;
         for (let d = nD - 2; d >= 0; d--) spStrides[d] = spStrides[d + 1] * nPerDim[d + 1];
         for (let flat = 0; flat < nTotal; flat++) {
           for (let d = 0; d < nD; d++) {
-            cBufs[spatialDims[d]].push(dimArrs[d][Math.floor(flat / spStrides[d]) % nPerDim[d]]);
+            coords[spatialDims[d]][offset + flat] = dimArrs[d][Math.floor(flat / spStrides[d]) % nPerDim[d]];
           }
         }
         for (const [varName, rawArr] of Object.entries(tile.variables ?? {})) {
-          if (!(varName in vBufs)) vBufs[varName] = [];
+          const varOut = variables[varName];
+          if (!varOut) continue;
           const vmeta = this._meta.var_meta?.[varName];
           if (!vmeta) continue;
           const varDims = vmeta.dims;
@@ -1409,25 +1496,17 @@ var webxtile = (() => {
             varStrides[d] = varStrides[d + 1] * varShape[d + 1];
           }
           for (let flat = 0; flat < nTotal; flat++) {
-            const spIdxs = new Array(nD);
-            for (let d = 0; d < nD; d++) {
-              spIdxs[d] = Math.floor(flat / spStrides[d]) % nPerDim[d];
-            }
             let vi = 0;
             for (let vd = 0; vd < varDims.length; vd++) {
               const si = spAxis[vd];
-              vi += (si >= 0 ? spIdxs[si] : 0) * varStrides[vd];
+              vi += (si >= 0 ? Math.floor(flat / spStrides[si]) % nPerDim[si] : 0) * varStrides[vd];
             }
-            vBufs[varName].push(rawArr[vi] ?? NaN);
+            varOut[offset + flat] = rawArr[vi] ?? NaN;
           }
         }
+        offset += nTotal;
       }
-      const count = Object.values(cBufs)[0]?.length ?? 0;
-      return {
-        coords: Object.fromEntries(Object.entries(cBufs).map(([k, v]) => [k, new Float32Array(v)])),
-        variables: Object.fromEntries(Object.entries(vBufs).map(([k, v]) => [k, new Float32Array(v)])),
-        count
-      };
+      return { coords, variables, count: totalCount };
     }
   };
   var WebxtileLoader = class {
@@ -1449,6 +1528,8 @@ var webxtile = (() => {
       this._release = release;
       this._idbConcurrent = 0;
       this._idbWaiters = [];
+      this._bboxActive = 0;
+      this._bboxIdleWaiters = [];
     }
     _acquireIdb() {
       return new Promise((resolve) => {
@@ -1467,12 +1548,18 @@ var webxtile = (() => {
         this._idbConcurrent--;
       }
     }
-    async _fetchBytes(url) {
+    // Resolves immediately when no loadBBox call is in flight; otherwise waits.
+    _waitBboxIdle() {
+      if (this._bboxActive === 0) return Promise.resolve();
+      return new Promise((r) => this._bboxIdleWaiters.push(r));
+    }
+    async _doFetch(url, nullable) {
       await this._acquire();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 6e4);
       try {
         const res = await fetch(url, { signal: controller.signal });
+        if (res.status === 404 && nullable) return null;
         if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
         return new Uint8Array(await res.arrayBuffer());
       } catch (err) {
@@ -1482,6 +1569,12 @@ var webxtile = (() => {
         clearTimeout(timer);
         this._release();
       }
+    }
+    async _fetchBytes(url) {
+      return this._doFetch(url, false);
+    }
+    async _fetchBytesOrNull(url) {
+      return this._doFetch(url, true);
     }
     // ── Initialisation ──────────────────────────────────────────────────────────
     /**
@@ -1517,6 +1610,11 @@ var webxtile = (() => {
       return _decodeMsgpack(bytes);
     }
     async _loadTile(filename) {
+      const tile = await this._loadTileOrNull(filename);
+      if (tile === null) throw new Error(`Tile not found: ${filename}`);
+      return tile;
+    }
+    async _loadTileOrNull(filename) {
       if (this._memCache.has(filename)) return this._memCache.get(filename);
       if (this._db) {
         await this._acquireIdb();
@@ -1533,7 +1631,8 @@ var webxtile = (() => {
           return tile2;
         }
       }
-      const bytes = await this._fetchBytes(`${this._base}/${filename}`);
+      const bytes = await this._fetchBytesOrNull(`${this._base}/${filename}`);
+      if (bytes === null) return null;
       if (this._db) {
         this._acquireIdb().then(
           () => this._db.put("tiles", bytes, filename).catch(() => {
@@ -1545,93 +1644,218 @@ var webxtile = (() => {
       this._memCache.set(filename, tile);
       return tile;
     }
+    /**
+     * Load a manifest tile (from the manifest/ subdirectory), returning null on 404.
+     * Manifest tiles are NOT cached in IDB — they are small and may be re-written.
+     */
+    async _loadManifestOrNull(filename) {
+      const url = `${this._base}/manifest/${filename}`;
+      const bytes = await this._fetchBytesOrNull(url);
+      if (bytes === null) return null;
+      return _decodeMsgpack(bytes);
+    }
     // ── Octree traversal ────────────────────────────────────────────────────────
     /**
-     * Recursively collect all tiles that satisfy the bbox and level constraints,
-     * mirroring the Python `_collect_tiles` logic.
+     * Collect tiles by following children arrays (tree traversal).
+     * Used when level is null (full resolution) or for any case where
+     * candidate names are not known via the naming scheme.
      *
-     * @param {string}        filename  - tile filename relative to base URL
-     * @param {number[]|null} bbox      - query bbox (null = no spatial filter)
-     * @param {number|null}   level     - max depth (null = leaves)
-     * @param {number}        nSpatial  - 2 or 3
+     * @param {string}        filename
+     * @param {number[]|null} bbox
+     * @param {number}        nSpatial
      * @returns {Promise<object[]>}
      */
-    async _collectTiles(rootFilename, bbox, level, nSpatial) {
-      const collected = [];
-      let frontier = [{ filename: rootFilename, groupId: -1 }];
-      const groups = [];
-      const visited = /* @__PURE__ */ new Set([rootFilename]);
+    async _collectByTraversal(filename, bbox, nSpatial) {
+      const tile = await this._loadTileOrNull(filename);
+      if (!tile) return [];
+      if (!_intersects(tile.bounds, bbox, nSpatial)) return [];
+      const isLeaf = tile.is_leaf ?? (!tile.children || tile.children.length === 0);
+      if (isLeaf) return [tile];
+      const children = tile.children ?? [];
+      const childResults = await Promise.all(
+        children.map((fn) => this._collectByTraversal(fn, bbox, nSpatial))
+      );
+      const flat = childResults.flat();
+      return flat.length > 0 ? flat : [tile];
+    }
+    /**
+     * Fetch tiles for a bbox query without traversing intermediate levels.
+     *
+     * Algorithm:
+     *   1. Read global bounds from metadata (no network fetch required).
+     *   2. Generate candidate filenames at `level` by recursively halving the
+     *      root bounds and keeping only those that intersect `bbox`.
+     *   3. Batch-fetch all candidates in parallel (16 at a time).
+     *   4. For each candidate that returned 404, walk up the parent chain
+     *      (_parentFilename strips one _N suffix per step) until an existing
+     *      tile is found.  A Set deduplicates ancestors shared by multiple
+     *      missing candidates.  The root tile is fetched lazily only if the
+     *      fallback walk reaches it.
+     *
+     * When manifest_depth is set in metadata, the manifest is consulted first
+     * to filter candidates, eliminating 404 requests for sparse datasets.
+     *
+     * @param {string}        rootFilename
+     * @param {number[]|null} bbox     - spatial filter; null = no filter
+     * @param {number}        level    - target octree depth (0 = root only)
+     * @param {number}        nSpatial - 2 or 3
+     * @returns {Promise<object[]>}
+     */
+    async _collectBBox(rootFilename, bbox, level, nSpatial) {
+      const rootBounds = this._meta.bounds;
+      if (!_intersects(rootBounds, bbox, nSpatial)) return [];
+      if (level === 0) {
+        return [await this._loadTile(rootFilename)];
+      }
+      const spatialDims = this._meta.spatial_dims;
+      const splitAxes = this._meta.split_axes ?? spatialDims;
+      const candidates = _candidatesAtLevel(rootFilename, rootBounds, bbox, level, spatialDims, splitAxes);
+      const manifestDepth = this._meta.manifest_depth ?? null;
+      if (manifestDepth != null) {
+        const mLevel = Math.max(0, level - manifestDepth);
+        const mCandidates = _candidatesAtLevel(rootFilename, rootBounds, bbox, mLevel, spatialDims, splitAxes);
+        const branch = 1 << splitAxes.length;
+        const mTiles = await Promise.all(
+          mCandidates.map((fn) => this._loadManifestOrNull("m_" + fn))
+        );
+        if (mTiles.some((m) => m !== null)) {
+          const existingCandidates = candidates.filter((candidate) => {
+            const stem = candidate.replace(/\.msgpack$/, "");
+            for (let mi = 0; mi < mCandidates.length; mi++) {
+              const mTile = mTiles[mi];
+              if (!mTile) continue;
+              const mRoot = (mTile.root ?? mCandidates[mi]).replace(/\.msgpack$/, "");
+              if (!stem.startsWith(mRoot)) continue;
+              const suffix = stem.slice(mRoot.length);
+              const parts = suffix ? suffix.split("_").slice(1) : [];
+              if (parts.length > manifestDepth) continue;
+              const idx = _bfsTileIndexIter(parts, branch);
+              return _tileExists(mTile.tiles, idx);
+            }
+            return true;
+          });
+          const tiles = await Promise.all(existingCandidates.map((fn) => this._loadTile(fn)));
+          return tiles.filter(Boolean);
+        }
+      }
+      const seen = /* @__PURE__ */ new Map();
+      for (let i = 0; i < candidates.length; i += 16) {
+        const batch = candidates.slice(i, i + 16).filter((fn) => !seen.has(fn));
+        const tiles = await Promise.all(batch.map((fn) => this._loadTileOrNull(fn)));
+        batch.forEach((fn, j) => seen.set(fn, tiles[j]));
+      }
+      const resultFiles = /* @__PURE__ */ new Set();
+      for (const candidate of candidates) {
+        let fn = candidate;
+        while (seen.get(fn) == null) {
+          const parent = _parentFilename(fn);
+          if (parent === null) {
+            if (!seen.has(fn)) seen.set(fn, await this._loadTileOrNull(fn));
+            break;
+          }
+          if (!seen.has(parent)) seen.set(parent, await this._loadTileOrNull(parent));
+          fn = parent;
+        }
+        if (seen.get(fn) != null) resultFiles.add(fn);
+      }
+      return [...resultFiles].map((fn) => seen.get(fn)).filter(Boolean);
+    }
+    /**
+     * Async generator that streams every leaf tile in the dataset via a
+     * full BFS traversal.  Background use only — yields between batches and
+     * pauses automatically whenever a `loadBBox` call is in flight so that
+     * interactive queries are not starved of fetch slots.
+     *
+     * @param {object}      [options={}]
+     * @param {AbortSignal} [options.signal] - cancellation signal
+     * @yields {object} decoded tile objects (same shape as `WebxtileResult.tiles`)
+     *
+     * @example
+     *   const stream = loader.streamLeaves();
+     *   for await (const tile of stream) {
+     *     cache.add(tile);
+     *   }
+     *
+     *   // Cancel at any time:
+     *   const ac = new AbortController();
+     *   for await (const tile of loader.streamLeaves({ signal: ac.signal })) { … }
+     *   ac.abort();
+     */
+    async *streamLeaves({ signal } = {}) {
+      if (!this._meta) throw new Error("Call open() before streamLeaves()");
+      const nSpatial = this._meta.spatial_dims.length;
+      const rootFile = this._meta.root_tile ?? "root.msgpack";
+      const visited = /* @__PURE__ */ new Set([rootFile]);
+      let frontier = [rootFile];
       while (frontier.length > 0) {
+        if (signal?.aborted) return;
+        await this._waitBboxIdle();
+        if (signal?.aborted) return;
         const next = [];
         for (let i = 0; i < frontier.length; i += 16) {
+          await this._waitBboxIdle();
+          if (signal?.aborted) return;
           const batch = frontier.slice(i, i + 16);
-          const tiles = await Promise.all(batch.map(({ filename }) => this._loadTile(filename)));
-          for (let j = 0; j < tiles.length; j++) {
-            const tile = tiles[j];
-            const groupId = batch[j].groupId;
-            const group = groupId >= 0 ? groups[groupId] : null;
-            const passes = _intersects(tile.bounds, bbox, nSpatial);
-            if (group) {
-              if (passes) group.accepted++;
-              if (--group.remaining === 0 && group.accepted === 0) {
-                collected.push(group.fallback);
-              }
-              if (!passes) continue;
-            } else if (!passes) {
-              continue;
-            }
+          const tiles = await Promise.all(batch.map((fn) => this._loadTile(fn)));
+          for (const tile of tiles) {
             const isLeaf = tile.is_leaf ?? tile.children == null;
-            const tileLevel = tile.level ?? 0;
-            if (isLeaf || level !== null && tileLevel >= level) {
-              collected.push(tile);
-              continue;
-            }
             const children = tile.children ?? [];
-            if (children.length === 0) {
-              collected.push(tile);
+            if (isLeaf || children.length === 0) {
+              yield tile;
               continue;
             }
             const newChildren = children.filter((fn) => !visited.has(fn));
             for (const fn of newChildren) visited.add(fn);
-            if (newChildren.length === 0) {
-              collected.push(tile);
-              continue;
-            }
-            const gid = groups.length;
-            groups.push({ fallback: tile, accepted: 0, remaining: newChildren.length });
-            next.push(...newChildren.map((fn) => ({ filename: fn, groupId: gid })));
+            next.push(...newChildren);
           }
         }
         frontier = next;
       }
-      return collected;
     }
     // ── Public API ──────────────────────────────────────────────────────────────
     /**
-     * Load all tiles intersecting `bbox` down to the requested `level`.
+     * Load tiles intersecting `bbox` at octree depth `level`.
      *
-     * @param {number[]|null} [bbox=null]
-     *   Spatial bounding box in the same coordinate system as the dataset.
+     * When `level` is omitted or null, a full tree traversal following
+     * children arrays is used (full resolution, all leaf tiles).  Use
+     * `streamLeaves()` instead for background progressive loading.
+     *
+     * For branches that terminate above `level` the deepest available tile is
+     * used.  For branches where no child passes the bbox filter the coarser
+     * parent is used as a fallback.
+     *
+     * @param {number[]|null} bbox
+     *   Spatial bounding box in the same CRS as the dataset.
      *   - 2-D: `[x_min, y_min, x_max, y_max]`
      *   - 3-D: `[x_min, y_min, z_min, x_max, y_max, z_max]`
-     *   Pass `null` to load the entire dataset (no spatial filter).
+     *   Pass `null` for no spatial filter (whole dataset at this level).
      *
-     * @param {object}      [options={}]
-     * @param {number|null} [options.level=null]
-     *   Maximum octree depth to descend.
-     *   - `null` (default): load all leaf tiles (full resolution).
-     *   - `0`: load only the root tile (coarsest overview).
-     *   - `N`: load tiles at depth N; uses the deepest available leaf for
-     *     branches that terminate before depth N.
+     * @param {number|null} [level]
+     *   Octree depth to descend to.  0 = root tile only (coarsest overview).
+     *   Omit or pass null for full resolution via tree traversal.
      *
-     * @returns {Promise<GridResult>}
+     * @returns {Promise<WebxtileResult>}
      */
-    async loadBBox(bbox = null, { level = null } = {}) {
+    async loadBBox(bbox, level) {
       if (!this._meta) throw new Error("Call open() before loadBBox()");
-      const nSpatial = this._meta.spatial_dims.length;
-      const rootFile = this._meta.root_tile ?? "root.msgpack";
-      const tiles = await this._collectTiles(rootFile, bbox, level, nSpatial);
-      return new WebxtileResult(this._meta, tiles);
+      this._bboxActive++;
+      try {
+        const nSpatial = this._meta.spatial_dims.length;
+        const rootFile = this._meta.root_tile ?? "root.msgpack";
+        let tiles;
+        if (level == null) {
+          tiles = await this._collectByTraversal(rootFile, bbox, nSpatial);
+        } else {
+          tiles = await this._collectBBox(rootFile, bbox, level, nSpatial);
+        }
+        return new WebxtileResult(this._meta, tiles);
+      } finally {
+        this._bboxActive--;
+        if (this._bboxActive === 0) {
+          const waiters = this._bboxIdleWaiters.splice(0);
+          for (const r of waiters) r();
+        }
+      }
     }
     /**
      * Clear all cached tiles from both the in-memory cache and IndexedDB.

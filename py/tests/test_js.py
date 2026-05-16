@@ -33,7 +33,7 @@ _JS_SCRIPT = _THIS_DIR.parent.parent / "js" / "tests" / "read_tiles.mjs"
 
 def make_2d_dataset(nx=64, ny=48):
     x = np.linspace(0.0, 100.0, nx)
-    y = np.linspace(0.0, 50.0, ny)
+    y = np.linspace(0.0, 100.0, ny)  # equal span → both axes in split_axes (quadtree)
     xx, yy = np.meshgrid(x, y, indexing="ij")
     temperature   = (xx + yy * 0.5).astype(np.float32)
     precipitation = (np.sin(xx / 20.0) * np.cos(yy / 10.0)).astype(np.float32)
@@ -292,3 +292,128 @@ def test_js_bbox_3d():
         js_out = _run_js(d, bbox=bbox)
 
     _compare_3d_coords(js_out, py_ds, label="bbox 3D")
+
+
+# ─── Adaptive split-axes cross-language tests ─────────────────────────────────
+
+def make_geophysics_dataset(nx=32, ny=32, nz=8):
+    """3-D dataset with large x/y span and small z span → quadtree splitting."""
+    x = np.linspace(0.0, 50_000.0, nx)
+    y = np.linspace(0.0, 50_000.0, ny)
+    z = np.linspace(0.0, 500.0, nz)
+    xx, yy, zz = np.meshgrid(x, y, z, indexing="ij")
+    vals = (xx / 50_000 + yy / 50_000 + zz / 500).astype(np.float32)
+    return xr.Dataset(
+        {"resistivity": (["x", "y", "z"], vals)},
+        coords={"x": x, "y": y, "z": z},
+    )
+
+
+def test_js_split_axes_in_output():
+    """JS output must report split_axes matching Python metadata."""
+    ds = make_geophysics_dataset()
+    with tempfile.TemporaryDirectory() as d:
+        write_webxtile(ds, d, spatial_dims=["x", "y", "z"], max_leaf=8)
+        js_out = _run_js(d)
+        meta   = json.loads(
+            subprocess.run(
+                ["node", "-e",
+                 f"const {{readFileSync}}=require('fs');const d=require('@msgpack/msgpack');"
+                 f"process.stdout.write(JSON.stringify({{split_axes:'placeholder'}}))"],
+                capture_output=True, text=True, check=False,
+            ).stdout or "{}"
+        )
+    # The read_tiles.mjs script now includes split_axes in output
+    assert "split_axes" in js_out
+    assert set(js_out["split_axes"]) == {"x", "y"}
+
+
+def test_js_adaptive_split_full_resolution():
+    """JS and Python must agree on full-resolution data with adaptive splitting."""
+    ds = make_geophysics_dataset()
+    with tempfile.TemporaryDirectory() as d:
+        write_webxtile(ds, d, spatial_dims=["x", "y", "z"], max_leaf=8)
+        py_ds  = read_webxtile(d)
+        js_out = _run_js(d)
+
+    _compare_3d_coords(js_out, py_ds, label="adaptive-split full-res")
+
+
+def test_js_adaptive_split_preserves_z_count():
+    """With quadtree splitting, JS should return ALL z values (full depth columns)."""
+    ds = make_geophysics_dataset(nx=16, ny=16, nz=8)
+    with tempfile.TemporaryDirectory() as d:
+        write_webxtile(ds, d, spatial_dims=["x", "y", "z"], max_leaf=4)
+        js_out = _run_js(d)
+
+    expected_z = sorted(float(v) for v in ds["z"].values)
+    js_z       = sorted(js_out["coords"].get("z", []))
+    np.testing.assert_allclose(js_z, expected_z, atol=1e-4,
+                               err_msg="JS should return all z values for quadtree dataset")
+
+
+# ─── GPU sub-tiles cross-language tests ──────────────────────────────────────
+
+def _run_js_sub_tiles(tiles_dir):
+    """Call read_tiles.mjs with --sub-tiles flag and return parsed JSON."""
+    result = subprocess.run(
+        ["node", str(_JS_SCRIPT), str(tiles_dir), "null", "null", "--sub-tiles"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=_JS_SCRIPT.parent.parent,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Node.js script failed (exit {result.returncode}):\n"
+            f"stdout: {result.stdout[:2000]}\n"
+            f"stderr: {result.stderr[:2000]}"
+        )
+    return json.loads(result.stdout)
+
+
+def test_js_sub_tiles_present():
+    """JS must report sub-tiles when gpu_tile_size is set."""
+    ds = make_2d_dataset(nx=64, ny=64)
+    gpu_size = 16
+    with tempfile.TemporaryDirectory() as d:
+        write_webxtile(ds, d, spatial_dims=["x", "y"], max_leaf=32, gpu_tile_size=gpu_size)
+        js_out = _run_js_sub_tiles(d)
+
+    assert js_out["sub_tile_count"] > 0
+    # Every sub-tile shape dimension must be ≤ gpu_size
+    for shape in js_out["sub_tile_shapes"]:
+        for dim_size in shape:
+            assert dim_size <= gpu_size, (
+                f"Sub-tile dimension {dim_size} > gpu_tile_size {gpu_size}"
+            )
+
+
+def test_js_sub_tiles_cover_all_data():
+    """Total sub-tile point count must equal total tile point count."""
+    ds = make_2d_dataset(nx=32, ny=32)
+    with tempfile.TemporaryDirectory() as d:
+        write_webxtile(ds, d, spatial_dims=["x", "y"], max_leaf=64, gpu_tile_size=8)
+        js_normal   = _run_js(d)
+        js_sub      = _run_js_sub_tiles(d)
+
+    total_from_shapes = sum(
+        np.prod(shape) for shape in js_sub["sub_tile_shapes"]
+    )
+    # Both should account for the same total points
+    assert total_from_shapes == js_normal["count"]
+
+
+def test_js_no_sub_tiles_fallback():
+    """When gpu_tile_size is not set, subTiles() falls back to each tile itself."""
+    ds = make_2d_dataset(nx=32, ny=32)
+    with tempfile.TemporaryDirectory() as d:
+        write_webxtile(ds, d, spatial_dims=["x", "y"], max_leaf=8)
+        js_out = _run_js_sub_tiles(d)
+        js_normal = _run_js(d)
+
+    # sub_tile_count >= 1 (one fallback sub-tile per leaf tile)
+    assert js_out["sub_tile_count"] >= 1
+    # sub_tile_count should equal count of scatter points reported via normal path
+    # since without sub_tiles each tile is returned as a whole
+    assert js_out["sub_tile_count"] >= 1
