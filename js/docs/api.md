@@ -189,53 +189,6 @@ metadata.
 
 ---
 
-### `result.toScatter()` → `{ coords, variables, count }`
-
-Expands all collected tile grids into flat parallel typed arrays, ready for
-WebGL scatter-plot or point-cloud rendering.
-
-```js
-const { coords, variables, count } = result.toScatter();
-
-// WebGL upload
-gl.bufferData(gl.ARRAY_BUFFER, coords.x, gl.STATIC_DRAW);
-```
-
-**Returns**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `coords` | `Object<string, Float32Array>` | One array per spatial dimension (`coords.x`, `coords.y`, …). Length = `count`. |
-| `variables` | `Object<string, Float32Array>` | One array per data variable. Length = `count`. NaN where a tile has no value for a variable. |
-| `count` | `number` | Number of grid points — the common length of every array. |
-
-**Algorithm — meshgrid expansion**
-
-For each tile:
-
-1. Read the 1-D `spatial_coords` array for each spatial dimension (e.g.
-   `x[nx]`, `y[ny]`).
-2. Compute `nTotal = nx × ny` (or `nx × ny × nz` for 3-D).
-3. For each flat index `flat ∈ [0, nTotal)`, compute the per-dimension index
-   using row-major (C-order) strides:
-   ```
-   idx_d = floor(flat / stride_d) % n_d
-   ```
-   where `stride_d = product of sizes of all dimensions after d`.
-4. Write `coord_d[idx_d]` into the output `coords[d]` array at position
-   `offset + flat`.
-
-For each variable, the same flat index is used to look up the value in the
-tile's variable array.  Variables that have non-spatial dimensions (e.g. a
-time axis) are sampled at index 0 of every non-spatial axis.
-
-**Implementation note**: `toScatter` uses a two-pass approach to avoid
-intermediate JavaScript arrays.  Pass 1 counts `nTotal` per tile and sums to
-`totalCount`; pass 2 writes directly into pre-allocated `Float32Array` buffers,
-keeping peak memory equal to the output size.
-
----
-
 ### `result.getCoord(dimName)` → `Float64Array`
 
 Returns the merged, sorted, deduplicated coordinate values for one spatial

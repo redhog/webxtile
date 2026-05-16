@@ -34,10 +34,11 @@ await loader.open();   // fetches metadata.msgpack
 // Load tiles at level 3 for a 2-D bounding box
 const result = await loader.loadBBox([500000, 6200000, 520000, 6220000], 3);
 
-// Flat arrays for WebGL / point-cloud rendering
-const { coords, variables, count } = result.toScatter();
-// coords.x, coords.y  — Float32Array, one value per grid point
-// variables.resistivity — Float32Array, same length as coords
+// Iterate GPU-sized sub-tiles for rendering
+for (const st of result.subTiles()) {
+  // st.spatial_coords — { x: Float64Array, y: Float64Array, … }
+  // st.variables      — { resistivity: Float32Array, … }
+}
 
 // Background: stream all leaf tiles (full resolution, whole dataset)
 const ac = new AbortController();
@@ -56,7 +57,7 @@ for await (const tile of loader.streamLeaves({ signal: ac.signal })) {
 | `loader.loadBBox(bbox, level)` | Load tiles intersecting `bbox` at octree depth `level`. |
 | `loader.streamLeaves([options])` | Async generator — yields all leaf tiles in BFS order. Pauses while `loadBBox` is in flight. |
 | `loader.clearCache()` | Evict all tiles from in-memory cache and IndexedDB. |
-| `result.toScatter()` | Expand tiles into flat `Float32Array` scatter arrays for rendering. |
+| `result.subTiles()` | Iterate GPU-sized sub-tiles; each has `spatial_coords` (1-D arrays) and `variables` (flat arrays). |
 | `result.getCoord(dim)` | Merged sorted coordinate values for one dimension across all tiles. |
 
 See [docs/api.md](docs/api.md) for full parameter descriptions, algorithms, and the concurrency/priority model.

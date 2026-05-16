@@ -421,19 +421,18 @@ test('sub_tiles: subTiles() total point count matches tile total', async ({ page
   await serveTiles(page, makeSubTileTileSet(gpuSize));
   await loadPage(page);
 
-  const counts = await page.evaluate(async () => {
+  const subTileTotal = await page.evaluate(async () => {
     const loader = new webxtile.WebxtileLoader('http://tiles.local');
     await loader.open();
     const r = await loader.loadBBox(null);
-    let subTileTotal = 0;
+    let total = 0;
     for (const st of r.subTiles()) {
-      subTileTotal += (st.shape ?? []).reduce((a, b) => a * b, 1);
+      total += (st.shape ?? []).reduce((a, b) => a * b, 1);
     }
-    return { subTileTotal, tileTotal: r.toScatter().count };
+    return total;
   });
 
-  expect(counts.subTileTotal).toBe(nx * ny);
-  expect(counts.subTileTotal).toBe(counts.tileTotal);
+  expect(subTileTotal).toBe(nx * ny);
 });
 
 test('sub_tiles: fallback when no sub_tiles field yields the tile itself', async ({ page }) => {

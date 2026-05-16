@@ -106,11 +106,64 @@ function collectTiles(tilesDir, filename, { bbox, level, nSpatial }) {
   return result.length > 0 ? result : [tile];
 }
 
-// ─── Grid extraction (convert scatter → indexed 2-D grid for comparison) ─────
+// ─── Scatter from sub-tiles ───────────────────────────────────────────────────
+// Expands each sub-tile's 1-D coord arrays to a meshgrid and concatenates
+// across all sub-tiles, producing the same {coords, variables, count} shape
+// that WebxtileResult.toScatter() used to return.
+
+function _scatter(result) {
+  const spatialDims = result.spatialDims;
+  const nD = spatialDims.length;
+
+  const coordParts = Object.fromEntries(spatialDims.map(d => [d, []]));
+  const varParts   = {};
+  let count = 0;
+
+  for (const st of result.subTiles()) {
+    const sc      = st.spatial_coords ?? {};
+    const dimArrs = spatialDims.map(d => sc[d] ?? new Float64Array(0));
+    const nPerDim = dimArrs.map(a => a.length);
+    const nTotal  = nPerDim.reduce((a, b) => a * b, 1);
+    if (nTotal === 0) continue;
+
+    const strides = new Array(nD);
+    strides[nD - 1] = 1;
+    for (let d = nD - 2; d >= 0; d--) strides[d] = strides[d + 1] * nPerDim[d + 1];
+
+    for (let di = 0; di < nD; di++) {
+      const arr = new Float32Array(nTotal);
+      for (let flat = 0; flat < nTotal; flat++) {
+        arr[flat] = dimArrs[di][Math.floor(flat / strides[di]) % nPerDim[di]];
+      }
+      coordParts[spatialDims[di]].push(arr);
+    }
+
+    for (const [varName, varArr] of Object.entries(st.variables ?? {})) {
+      if (!varParts[varName]) varParts[varName] = [];
+      varParts[varName].push(varArr instanceof Float32Array ? varArr : new Float32Array(varArr));
+    }
+
+    count += nTotal;
+  }
+
+  const merge = parts => {
+    const total  = parts.reduce((s, a) => s + a.length, 0);
+    const merged = new Float32Array(total);
+    let off = 0;
+    for (const a of parts) { merged.set(a, off); off += a.length; }
+    return merged;
+  };
+
+  const coords    = Object.fromEntries(spatialDims.map(d => [d, merge(coordParts[d])]));
+  const variables = Object.fromEntries(Object.entries(varParts).map(([k, p]) => [k, merge(p)]));
+  return { coords, variables, count };
+}
+
+// ─── Grid extraction ─────────────────────────────────────────────────────────
 
 function buildGrid(result, { subTilesMode = false } = {}) {
   const spatialDims = result.spatialDims;
-  const { coords, variables, count } = result.toScatter();
+  const { coords, variables, count } = _scatter(result);
 
   // Sorted unique coordinate values (Float64 precision, rounded to 6 dp)
   const sortedCoords = {};

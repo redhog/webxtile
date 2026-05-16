@@ -1429,85 +1429,6 @@ var webxtile = (() => {
         }
       }
     }
-    /**
-     * Flatten all loaded tiles into parallel scatter arrays.
-     *
-     * For each tile the 1-D spatial coordinate arrays (`spatial_coords`) are
-     * expanded into a full meshgrid and every data variable is read at each
-     * resulting grid point.  The output arrays are all the same length
-     * (`count`).
-     *
-     * Variables with non-spatial dimensions (e.g. time) are sampled at index 0
-     * of every non-spatial axis.  For full control over non-spatial dimensions
-     * use the raw `tiles` property.
-     *
-     * @returns {{ coords: Object<string,Float32Array>,
-     *             variables: Object<string,Float32Array>,
-     *             count: number }}
-     *
-     * @example
-     *   const { coords, variables, count } = result.toScatter();
-     *   gl.bufferData(gl.ARRAY_BUFFER, coords.x, gl.STATIC_DRAW);
-     */
-    toScatter() {
-      const spatialDims = this._meta.spatial_dims;
-      const nD = spatialDims.length;
-      const tileInfo = [];
-      let totalCount = 0;
-      const varNames = /* @__PURE__ */ new Set();
-      for (const tile of this._tiles) {
-        const sc = tile.spatial_coords ?? {};
-        const dimArrs = spatialDims.map((d) => sc[d] ?? new Float64Array(0));
-        const nPerDim = dimArrs.map((a) => a.length);
-        const nTotal = nPerDim.reduce((a, b) => a * b, 1);
-        tileInfo.push({ dimArrs, nPerDim, nTotal });
-        totalCount += nTotal;
-        for (const name of Object.keys(tile.variables ?? {})) varNames.add(name);
-      }
-      const coords = Object.fromEntries(spatialDims.map((d) => [d, new Float32Array(totalCount)]));
-      const variables = Object.fromEntries([...varNames].map((n) => [n, new Float32Array(totalCount).fill(NaN)]));
-      let offset = 0;
-      for (let ti = 0; ti < this._tiles.length; ti++) {
-        const tile = this._tiles[ti];
-        const { dimArrs, nPerDim, nTotal } = tileInfo[ti];
-        if (nTotal === 0) continue;
-        const spStrides = new Array(nD);
-        spStrides[nD - 1] = 1;
-        for (let d = nD - 2; d >= 0; d--) spStrides[d] = spStrides[d + 1] * nPerDim[d + 1];
-        for (let flat = 0; flat < nTotal; flat++) {
-          for (let d = 0; d < nD; d++) {
-            coords[spatialDims[d]][offset + flat] = dimArrs[d][Math.floor(flat / spStrides[d]) % nPerDim[d]];
-          }
-        }
-        for (const [varName, rawArr] of Object.entries(tile.variables ?? {})) {
-          const varOut = variables[varName];
-          if (!varOut) continue;
-          const vmeta = this._meta.var_meta?.[varName];
-          if (!vmeta) continue;
-          const varDims = vmeta.dims;
-          const spAxis = varDims.map((d) => spatialDims.indexOf(d));
-          const varShape = varDims.map((d, vi) => {
-            const si = spAxis[vi];
-            return si >= 0 ? nPerDim[si] : this._meta.dim_sizes?.[d] ?? 1;
-          });
-          const varStrides = new Array(varDims.length);
-          varStrides[varDims.length - 1] = 1;
-          for (let d = varDims.length - 2; d >= 0; d--) {
-            varStrides[d] = varStrides[d + 1] * varShape[d + 1];
-          }
-          for (let flat = 0; flat < nTotal; flat++) {
-            let vi = 0;
-            for (let vd = 0; vd < varDims.length; vd++) {
-              const si = spAxis[vd];
-              vi += (si >= 0 ? Math.floor(flat / spStrides[si]) % nPerDim[si] : 0) * varStrides[vd];
-            }
-            varOut[offset + flat] = rawArr[vi] ?? NaN;
-          }
-        }
-        offset += nTotal;
-      }
-      return { coords, variables, count: totalCount };
-    }
   };
   var WebxtileLoader = class {
     /**
@@ -1781,10 +1702,85 @@ var webxtile = (() => {
      *   for await (const tile of loader.streamLeaves({ signal: ac.signal })) { … }
      *   ac.abort();
      */
+    async *_streamLeavesViaManifest(rootFile, manifestDepth, signal) {
+      const splitAxes = this._meta.split_axes ?? this._meta.spatial_dims;
+      const branch = 1 << splitAxes.length;
+      const levelStarts = new Array(manifestDepth + 1);
+      let s = 0;
+      for (let d = 0; d <= manifestDepth; d++) {
+        levelStarts[d] = s;
+        s += Math.pow(branch, d);
+      }
+      function scanManifest(manifest, rootStem2) {
+        const bitmap = manifest.tiles;
+        const leaves = [], boundaries = [];
+        const stack = [[0, rootStem2, 0]];
+        while (stack.length > 0) {
+          const [idx, stem, depth] = stack.pop();
+          if (!_tileExists(bitmap, idx)) continue;
+          if (depth === manifestDepth) {
+            boundaries.push(stem);
+            continue;
+          }
+          const posInLevel = idx - levelStarts[depth];
+          const childStart = levelStarts[depth + 1];
+          let hasChildren = false;
+          for (let c = 0; c < branch; c++) {
+            const ci = childStart + posInLevel * branch + c;
+            if (_tileExists(bitmap, ci)) {
+              hasChildren = true;
+              stack.push([ci, stem + "_" + c, depth + 1]);
+            }
+          }
+          if (!hasChildren) leaves.push(stem + ".msgpack");
+        }
+        return { leaves, boundaries };
+      }
+      const rootStem = rootFile.replace(/\.msgpack$/, "");
+      let frontier = [{ mFile: "m_" + rootFile, rootStem }];
+      const allLeaves = /* @__PURE__ */ new Set();
+      const visitedManifests = /* @__PURE__ */ new Set(["m_" + rootFile]);
+      while (frontier.length > 0) {
+        if (signal?.aborted) return;
+        const mTiles = await Promise.all(
+          frontier.map(({ mFile }) => this._loadManifestOrNull(mFile))
+        );
+        const nextFrontier = [];
+        for (let fi = 0; fi < frontier.length; fi++) {
+          const m = mTiles[fi];
+          if (!m) continue;
+          const { leaves, boundaries } = scanManifest(m, frontier[fi].rootStem);
+          for (const leaf of leaves) allLeaves.add(leaf);
+          for (const stem of boundaries) {
+            const mFile = "m_" + stem + ".msgpack";
+            if (!visitedManifests.has(mFile)) {
+              visitedManifests.add(mFile);
+              nextFrontier.push({ mFile, rootStem: stem });
+            }
+          }
+        }
+        frontier = nextFrontier;
+      }
+      const leafArr = [...allLeaves];
+      for (let i = 0; i < leafArr.length; i += 16) {
+        if (signal?.aborted) return;
+        await this._waitBboxIdle();
+        if (signal?.aborted) return;
+        const batch = leafArr.slice(i, i + 16);
+        const tiles = await Promise.all(batch.map((fn) => this._loadTileOrNull(fn)));
+        for (const tile of tiles) {
+          if (tile) yield tile;
+        }
+      }
+    }
     async *streamLeaves({ signal } = {}) {
       if (!this._meta) throw new Error("Call open() before streamLeaves()");
-      const nSpatial = this._meta.spatial_dims.length;
       const rootFile = this._meta.root_tile ?? "root.msgpack";
+      const manifestDepth = this._meta.manifest_depth ?? null;
+      if (manifestDepth != null) {
+        yield* this._streamLeavesViaManifest(rootFile, manifestDepth, signal);
+        return;
+      }
       const visited = /* @__PURE__ */ new Set([rootFile]);
       let frontier = [rootFile];
       while (frontier.length > 0) {

@@ -114,7 +114,9 @@ def write_webxtile(
         )
 
     if max_leaf is None:
-        max_leaf = 32 if len(spatial_dims) == 3 else 128
+        max_leaf = 256 if len(spatial_dims) == 3 else 4096
+    if gpu_tile_size is None:
+        gpu_tile_size = 64 if len(spatial_dims) == 3 else 256
 
     split_axes = _compute_split_axes(ds, spatial_dims)
 

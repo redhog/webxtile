@@ -7,11 +7,12 @@
 | Adaptive axis splitting | ✅ Implemented | `_compute_split_axes`; `split_axes` in metadata; Python writer + JS reader use it |
 | GPU sub-tiles (S3 inner level) | ✅ Implemented | `gpu_tile_size` param; leaf tiles carry `sub_tiles` field; `WebxtileResult.subTiles()` in JS |
 | Manifest pyramid (S8) | ✅ Implemented | `write_manifest` param; `manifest/m_*.msgpack`; JS skips 404s using bitmaps |
-| S3 outer-level bundling | ❌ Not yet | `streamLeaves()` still O(depth) round-trips; bundled network files not written |
-| S0 (`max_leaf` tuning) | ❌ Not yet | Still uses defaults (32 for 3D, 128 for 2D) |
+| `streamLeaves()` manifest acceleration | ✅ Implemented | Uses manifest bitmaps to enumerate leaves without fetching data tiles; O(ceil(depth/manifest_depth)) round-trips instead of O(depth) |
+| S0 (`max_leaf` + `gpu_tile_size` defaults) | ✅ Implemented | `max_leaf`: 4096 (2D) / 256 (3D); `gpu_tile_size`: 256 (2D) / 64 (3D) — ~16M points per network tile, ~65K per GPU sub-tile |
+| Sub-tile streaming to GPU (S4 superseded) | ✅ Implemented | `toScatter()` removed; `WebxtileDataset` stores sub-tiles directly; `GridLayer` does per-sub-tile meshgrid expansion and one draw call per sub-tile |
+| S3 outer-level bundling | ❌ Not yet | `streamLeaves()` manifest reduces but doesn't eliminate round-trips; bundled network files not written |
 | S1 (directory sharding) | ❌ Not yet | |
 | S2 (single-file archive) | ❌ Not yet | |
-| S4 (streaming `toScatter()`) | ❌ Not yet | |
 | S5 (IndexedDB LRU) | ❌ Not yet | |
 
 ---
@@ -109,19 +110,13 @@ At hundreds of thousands of tiles: filesystem inodes become a practical constrai
 
 Each tile is an atomic msgpack blob fetched in full. There is no sub-tile byte-range access, so you cannot partially stream a tile or compose a larger logical tile from partial reads. Every fetch is all-or-nothing.
 
-### 3. Memory Pressure from `toScatter()`
+### 3. ~~Memory Pressure from `toScatter()`~~ ✅ Resolved
 
-`toScatter()` expands each tile's compact 1D coordinate arrays into a full meshgrid before returning data. For a tile with shape [N, M] and K variables:
+`toScatter()` has been removed. The rendering path now uses `WebxtileResult.subTiles()` directly: `WebxtileDataset` stores per-sub-tile typed arrays, and `GridLayer` performs meshgrid expansion per sub-tile (~0.8 MB peak per 256×256 sub-tile) and issues one instanced draw call per sub-tile. There is no longer a full-dataset merge in the JS heap.
 
-```
-memory = N × M × (2 coords + K vars) × 4 bytes
-```
+### 4. ~~Non-Spatial Dimensions Truncated in `toScatter()`~~ ✅ Resolved
 
-A batch of 100 tiles each 64×64 with 5 variables = ~80 MB peak, before any rendering buffer. Deep LOD queries fetching many tiles at once can easily exceed 500 MB in the browser JS heap.
-
-### 4. Non-Spatial Dimensions Truncated in `toScatter()`
-
-`toScatter()` samples non-spatial axes (time, depth index, ensemble member, etc.) at **index 0 only**. Full ND access requires working directly with raw tile objects, which is significantly more complex on the consumer side.
+`toScatter()` has been removed. Raw tile objects (via `subTiles()`) expose all dimensions without truncation. Non-spatial coordinate arrays are embedded in `metadata.msgpack` and are available through `WebxtileResult.coordMeta`.
 
 ### 5. HTTP Concurrency
 
@@ -131,7 +126,7 @@ The library enforces a 16-fetch semaphore to avoid browser connection exhaustion
 
 The coordinate-midpoint approximation can produce false positives (candidates that don't exist → 404 → parent fallback, one extra sequential hop per 404 cluster) when coordinate spacing is non-uniform. For regular grids this is rare.
 
-`streamLeaves()` (full BFS traversal, explicitly background-only) **does** require O(depth) sequential round-trips because it reads child filenames from each tile's `children` field and processes level by level.
+`streamLeaves()` now uses the manifest pyramid when `manifest_depth` is present in metadata: it walks manifest bitmaps to enumerate all leaf filenames without fetching any data tiles, then batch-fetches the leaves. Round-trips drop from O(depth) to O(ceil(depth / manifest_depth)) manifest fetches + 1 data fetch. Without a manifest, the original O(depth) BFS fallback is used.
 
 ### 6. IndexedDB Cache — No Eviction
 
@@ -145,13 +140,15 @@ Spatial coordinates are stored as float64 in tiles but data variables are float3
 
 ## Suggested Solutions
 
-### S0 — Increase `max_leaf` (zero code changes)
+### S0 — Increase `max_leaf` ✅ Implemented
 
 **`max_leaf` unit**: points along the **longest single spatial axis**. A leaf tile can be up to `max_leaf^ndim` total points — `max_leaf×max_leaf` for 2D, `max_leaf×max_leaf×max_leaf` for 3D.
 
-**Problem**: the default `max_leaf=32` produces very fine-grained tiles (32³ = ~32K points each) suited for general-purpose use but not browser rendering, where round-trip latency dominates over payload size.
+**New defaults** (as of current implementation):
+- `max_leaf`: **4096** for 2D, **256** for 3D — targeting ~16M points per network tile
+- `gpu_tile_size`: **256** for 2D, **64** for 3D — targeting ~65K points per GPU sub-tile
 
-**Effect of increasing `max_leaf`**:
+**Effect on tile counts**:
 
 | `max_leaf` | 2D tile (max pts) | 3D tile (max pts) | Depth (4096² grid) | Depth (256³ grid) | Tiles (4096² grid) |
 |-----------|-------------------|-------------------|-------------------|-------------------|--------------------|
@@ -160,19 +157,13 @@ Spatial coordinates are stored as float64 in tiles but data variables are float3
 | 256       | 65K               | **16M**           | 4                 | 0 (single tile)   | ~340               |
 | 4096      | **16M**           | —                 | 1                 | —                 | ~4                 |
 
-**Recommended values** to target ~16M points per leaf tile (a reasonable GPU buffer size):
-- **3D datasets**: `max_leaf=256` — 256³ = 16.7M points per tile
-- **2D datasets**: `max_leaf=4096` — 4096² = 16.8M points per tile
-
 **Tradeoffs**:
 - Fewer, larger tiles → fewer HTTP requests for any given query. Direct win.
 - Each tile transfers more bytes — on slow connections a single large tile may be slower than several small parallel ones.
 - LOD steps become coarser — at `max_leaf=4096` a 2D dataset has only 1–2 levels, so there is no smooth progressive load; the jump from overview to full resolution is large.
 - Less spatial selectivity — a zoomed-in query still fetches the full tile even if only a corner is visible.
 
-**When it works well**: geophysics workflows where users typically view the full dataset before zooming in, and where datasets fit within a few hundred MB. The LOD loss is acceptable if the whole dataset is usually needed anyway.
-
-**When it does not help**: very large datasets (multi-GB) where spatial selectivity is critical, or 3D datasets with a non-square aspect ratio where one axis is much larger than the others.
+These tradeoffs are acceptable for geophysics workflows because `gpu_tile_size` independently controls rendering granularity (GPU sub-tiles stay small regardless of network tile size).
 
 ---
 
@@ -238,23 +229,25 @@ The response body is raw msgpack bytes — identical to what the current decoder
 }
 ```
 
-- **Outer level** (network granularity): one HTTP fetch per bundle, ~200 MB. One round-trip for `streamLeaves()` instead of O(depth). ❌ Not yet implemented.
-- **Inner level** (GPU granularity): pre-partitioned, pre-sorted rendering sub-tiles packed as msgpack array fields. No byte-offset index needed — the client decodes the full msgpack into RAM (~200 MB, fine), then streams sub-tiles to the GPU one at a time. ✅ **Implemented**: leaf tiles carry an optional `sub_tiles` array when written with `gpu_tile_size`; `WebxtileResult.subTiles()` in JS iterates them (falls back to the tile itself when absent).
+- **Outer level** (network granularity): one HTTP fetch per bundle, ~200 MB. One round-trip for `streamLeaves()` instead of O(depth). ❌ Not yet implemented. (The manifest acceleration reduces `streamLeaves()` round-trips but does not eliminate them — data tiles are still fetched individually.)
+- **Inner level** (GPU granularity): pre-partitioned, pre-sorted rendering sub-tiles packed as msgpack array fields. ✅ **Implemented**: leaf tiles carry an optional `sub_tiles` array when written with `gpu_tile_size`; `WebxtileResult.subTiles()` in JS iterates them; `GridLayer` expands each sub-tile's 1D coord arrays to a meshgrid and issues one instanced draw call per sub-tile.
 
 The spatial partitioning and sorting of sub-tiles is done **once at write time**, not per client fetch. This is efficient because write-once / read-many: the client pays zero CPU for partitioning, just iterates the array and uploads.
 
-**Interaction with S0**: increasing `max_leaf` to reduce tile count is only safe because this bundle structure handles rendering granularity independently. Without S3's inner level, large `max_leaf` values would produce tiles that are too large to upload to the GPU in one buffer. The inner level (✅ implemented) already decouples network and GPU granularity; the outer level (❌ not yet) is needed only to fix `streamLeaves()` round-trips.
+**Interaction with S0**: increasing `max_leaf` to reduce tile count is only safe because this bundle structure handles rendering granularity independently. Without S3's inner level, large `max_leaf` values would produce tiles that are too large to upload to the GPU in one buffer. The inner level (✅ implemented) already decouples network and GPU granularity; the outer level (❌ not yet) is needed only to reduce `streamLeaves()` from O(ceil(depth/manifest_depth)) + 1 round-trips to O(1).
 
 ---
 
-### S4 — Lazy / Streaming `toScatter()` with Configurable Axes
+### S4 — Sub-tile streaming to GPU ✅ Implemented (supersedes `toScatter()`)
 
-**Problem**: `toScatter()` eagerly expands all tiles and only exposes index-0 for non-spatial dims.
+**Problem**: the original `toScatter()` eagerly merged all tiles into one large meshgrid-expanded flat array, creating peak memory pressure proportional to the full dataset size.
 
-**Solution**:
-- Accept a `dims` argument specifying which non-spatial indices to include (or a slice).
-- Return a lazy iterator instead of allocating one large buffer — let the caller page through tiles.
-- For rendering use cases, expose a `toFlatArrays()` method that returns `{x, y, z, var1, var2, ...}` typed arrays without intermediate meshgrid allocation, reducing peak memory by ~50%.
+**Resolution**: `toScatter()` has been removed entirely. The rendering pipeline now works directly with `subTiles()`:
+
+- `WebxtileDataset` stores the raw sub-tile objects from `WebxtileResult.subTiles()` — compact 1D coordinate arrays and flat variable arrays, one object per GPU sub-tile.
+- `WebxtileColumn.subTileArrays` exposes per-sub-tile typed arrays to consumers.
+- `GridLayer.createLayer()` iterates sub-tile arrays, expands each sub-tile's 1D coords to a meshgrid (~0.8 MB per 256×256 sub-tile), and returns one instanced draw call per sub-tile. Gladly renders all draw calls sequentially.
+- Peak JS heap is bounded by one sub-tile expansion at a time rather than the full dataset.
 
 ---
 
@@ -500,7 +493,7 @@ For WebXTile's use case, BFS ordering is sufficient and requires no Morton curve
 | S8 (manifest pyramid + bitmap) | Availability bitstreams | Same bit density; BFS vs Morton ordering; S8 is simpler to implement on top of existing naming scheme |
 | S5 (IndexedDB LRU) | Cesium memory budget + LRU | 3DT does this in RAM; WebXTile does it in persistent IndexedDB |
 | S0 (max_leaf tuning) | `geometricError` tuning | 3DT makes LOD continuous and view-dependent; WebXTile's is discrete depth levels |
-| S4 (streaming `toScatter()`) | Not needed in 3DT | Rendering path in WebXTile already bypasses `toScatter()` by streaming directly to Gladly |
+| S4 (sub-tile streaming) | Not needed in 3DT | `toScatter()` removed; rendering path streams sub-tiles directly to Gladly via per-sub-tile draw calls |
 
 The core architectural divergence is intentional: 3D Tiles is a **rendering-first** format (geometry → fixed GPU pipeline), WebXTile is a **science-first** format (fields → programmable GPU pipeline + analysis). They are complementary, not competing, for a system that needs both scientific analysis and high-performance rendering.
 
@@ -510,12 +503,13 @@ The core architectural divergence is intentional: 3D Tiles is a **rendering-firs
 
 For the Nagelfluh use case (geophysics grids, browser-based visualization):
 
-1. ✅ **Adaptive axis splitting** — implemented. Pure quadtree for geophysics datasets; full z column in every leaf tile.
-2. ✅ **S3 inner level** (GPU sub-tiles in leaf tiles) — implemented. `gpu_tile_size` parameter; `WebxtileResult.subTiles()` in JS. Decouples network granularity from GPU upload granularity.
-3. ✅ **S8** (existence manifest pyramid) — implemented. `write_manifest` parameter; JS uses bitmaps to skip 404 fetches for holey grids.
-4. **S0** (increase `max_leaf`) — tune at write time. Now safe to use large values because sub-tiles (S3 inner level) handle GPU granularity. Use `max_leaf=256` for 3D, `max_leaf=4096` for 2D to target ~16M points per network tile.
-5. **S3 outer level** (network bundling for `streamLeaves()`) — still needed to reduce `streamLeaves()` from O(depth) round-trips to O(1). Required if background streaming is performance-critical.
-6. **S5** (IndexedDB LRU) — low effort, prevents silent quota exhaustion.
-7. **S4** (streaming `toScatter()`) — important once datasets grow beyond single-session memory.
-8. **S2** (single-file archive) — operational win for large deployments; no browser benefit.
-9. **S1** (directory sharding) — quick defensive fix if S2 is deferred.
+1. ✅ **Adaptive axis splitting** — pure quadtree for geophysics datasets; full z column in every leaf tile.
+2. ✅ **S3 inner level** (GPU sub-tiles in leaf tiles) — `gpu_tile_size` parameter; `WebxtileResult.subTiles()`; `GridLayer` issues one draw call per sub-tile. Decouples network granularity from GPU granularity.
+3. ✅ **S8** (existence manifest pyramid) — `write_manifest` parameter; JS skips 404s using bitmaps.
+4. ✅ **S0** (`max_leaf` + `gpu_tile_size` defaults) — `max_leaf` 4096/256, `gpu_tile_size` 256/64; ~16M points per network tile, ~65K per GPU sub-tile.
+5. ✅ **`streamLeaves()` manifest acceleration** — manifest bitmaps eliminate data-tile fetches for child discovery; O(ceil(depth/manifest_depth)) + 1 round-trips instead of O(depth).
+6. ✅ **S4** (sub-tile streaming) — `toScatter()` removed; `WebxtileDataset` stores sub-tiles directly; per-sub-tile meshgrid expansion in `GridLayer` bounds peak heap to one sub-tile at a time.
+7. **S3 outer level** (network bundling) — still needed to collapse `streamLeaves()` to O(1) round-trips. Required if background streaming latency becomes a bottleneck.
+8. **S5** (IndexedDB LRU) — low effort, prevents silent quota exhaustion.
+9. **S2** (single-file archive) — operational win for large deployments; no browser benefit.
+10. **S1** (directory sharding) — quick defensive fix if S2 is deferred.
